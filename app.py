@@ -6,20 +6,20 @@ import subprocess
 from werkzeug.utils import secure_filename
 from flask_cors import CORS
 
-
 from pdf2docx import Converter
 from PIL import Image
 from pdf2image import convert_from_path
 import pikepdf
-from PyPDF2 import PdfReader, PdfWriter
+from PyPDF2 import PdfReader, PdfWriter, PdfMerger
 import pdfplumber
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
+# Allow poppler in Docker
+os.environ["PATH"] += ":/usr/bin"
 
-
-app.config['MAX_CONTENT_LENGTH'] = 200 * 1024 * 1024  # 200 MB limit
+app.config['MAX_CONTENT_LENGTH'] = 200 * 1024 * 1024  # 200 MB
 
 
 # --------------------------------------------------------
@@ -30,12 +30,22 @@ def tmp_file(ext=""):
     os.close(fd)
     return path
 
+
 def save_upload(file, ext=None):
+    """ SAFE write — prevents corrupt PDF uploads """
     filename = secure_filename(file.filename)
     extension = ext if ext else os.path.splitext(filename)[1]
     path = tmp_file(extension)
-    file.save(path)
+
+    with open(path, "wb") as f_out:
+        f_out.write(file.read())
+    try:
+        file.seek(0)
+    except:
+        pass
+
     return path
+
 
 def cleanup(path):
     try:
@@ -70,7 +80,7 @@ def pdf_to_word():
 
 
 # --------------------------------------------------------
-# 2 — Word → PDF  (requires LibreOffice on server)
+# 2 — Word → PDF
 # --------------------------------------------------------
 @app.post("/word-to-pdf")
 def word_to_pdf():
@@ -151,14 +161,15 @@ def jpg_to_pdf():
 
     try:
         for f in files:
-            path = save_upload(f)
-            temp_paths.append(path)
-            img = Image.open(path).convert("RGB")
+            p = save_upload(f)
+            temp_paths.append(p)
+            img = Image.open(p).convert("RGB")
             images.append(img)
 
-        output = tmp_file(".pdf")
-        images[0].save(output, save_all=True, append_images=images[1:])
-        return send_file(output, as_attachment=True, download_name="output.pdf")
+        out = tmp_file(".pdf")
+        images[0].save(out, save_all=True, append_images=images[1:])
+
+        return send_file(out, as_attachment=True, download_name="output.pdf")
 
     finally:
         for p in temp_paths:
@@ -166,7 +177,7 @@ def jpg_to_pdf():
 
 
 # --------------------------------------------------------
-# 5 — PDF → JPG (zip if multiple pages)
+# 5 — PDF → JPG  (single merged JPG)
 # --------------------------------------------------------
 @app.post("/pdf-to-jpg")
 def pdf_to_jpg():
@@ -177,20 +188,16 @@ def pdf_to_jpg():
     pdf = save_upload(f, ".pdf")
 
     try:
-        # Convert PDF to list of images
         pages = convert_from_path(pdf, dpi=200)
 
-        # Convert each page to RGB
+        if not pages:
+            return abort(400, "Could not read PDF pages")
+
         imgs = [p.convert("RGB") for p in pages]
 
-        # Calculate final JPG size
-        widths = [i.width for i in imgs]
-        heights = [i.height for i in imgs]
+        total_height = sum(img.height for img in imgs)
+        max_width = max(img.width for img in imgs)
 
-        total_height = sum(heights)
-        max_width = max(widths)
-
-        # Create one merged JPG
         merged = Image.new("RGB", (max_width, total_height), (255, 255, 255))
 
         y = 0
@@ -203,15 +210,12 @@ def pdf_to_jpg():
 
         return send_file(out_jpg, as_attachment=True, download_name="output.jpg")
 
-    except Exception as e:
-        return abort(500, f"Conversion failed: {str(e)}")
-
     finally:
         cleanup(pdf)
 
 
 # --------------------------------------------------------
-# 6 — Merge PDFs
+# 6 — Merge PDFs (best + correct way)
 # --------------------------------------------------------
 @app.post("/merge-pdf")
 def merge_pdf():
@@ -219,21 +223,20 @@ def merge_pdf():
     if not files:
         return abort(400, "No files")
 
-    writer = PdfWriter(strict=False)   # <-- FIXED
+    merger = PdfMerger()
     saved = []
 
     try:
         for f in files:
+            if not f.filename.lower().endswith(".pdf"):
+                return abort(400, "All files must be PDF")
             p = save_upload(f, ".pdf")
             saved.append(p)
-
-            reader = PdfReader(p)
-            for page in reader.pages:
-                writer.add_page(page)
+            merger.append(p)
 
         out = tmp_file(".pdf")
-        with open(out, "wb") as o:
-            writer.write(o)
+        merger.write(out)
+        merger.close()
 
         return send_file(out, as_attachment=True, download_name="merged.pdf")
 
@@ -244,7 +247,7 @@ def merge_pdf():
 
 
 # --------------------------------------------------------
-# 7 — Split PDF (returns ZIP)
+# 7 — Split PDF
 # --------------------------------------------------------
 @app.post("/split-pdf")
 def split_pdf():
@@ -263,7 +266,6 @@ def split_pdf():
         reader = PdfReader(pdf)
         total = len(reader.pages)
 
-        # parse ranges: "1-3,5,7-8"
         pages = []
         for part in ranges.split(","):
             if "-" in part:
@@ -276,7 +278,6 @@ def split_pdf():
 
         zip_path = tmp_file(".zip")
         import zipfile
-
         with zipfile.ZipFile(zip_path, "w") as z:
             for p in pages:
                 w = PdfWriter()
@@ -315,7 +316,6 @@ def rotate_pdf():
 
         for page in reader.pages:
             page.rotate(angle)
-
             writer.add_page(page)
 
         with open(out_pdf, "wb") as o:
@@ -341,7 +341,11 @@ def compress_pdf():
     out_pdf = tmp_file(".pdf")
 
     try:
-        p = pikepdf.open(pdf, allow_overwriting_input=True)  # <-- FIXED
+        try:
+            p = pikepdf.open(pdf, allow_overwriting_input=True)
+        except Exception as e:
+            return abort(400, f"Invalid or damaged PDF: {str(e)}")
+
         p.save(out_pdf, optimize_streams=True, linearize=True)
         p.close()
 
@@ -353,7 +357,7 @@ def compress_pdf():
 
 
 # --------------------------------------------------------
-# 10 — Protect PDF (password)
+# 10 — Protect PDF
 # --------------------------------------------------------
 @app.post("/protect-pdf")
 def protect_pdf():
@@ -386,7 +390,7 @@ def protect_pdf():
 
 
 # --------------------------------------------------------
-# 11 — Unlock PDF (requires password)
+# 11 — Unlock PDF
 # --------------------------------------------------------
 @app.post("/unlock-pdf")
 def unlock_pdf():
