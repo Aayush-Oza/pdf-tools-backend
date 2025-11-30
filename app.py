@@ -16,14 +16,14 @@ import pdfplumber
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-# Allow poppler in Docker
-os.environ["PATH"] += ":/usr/bin"
+# Allow poppler inside Docker
+os.environ["PATH"] += ":/usr/bin:/usr/local/bin"
 
 app.config['MAX_CONTENT_LENGTH'] = 200 * 1024 * 1024  # 200 MB
 
 
 # --------------------------------------------------------
-# Utility helpers
+# Utility Helpers
 # --------------------------------------------------------
 def tmp_file(ext=""):
     fd, path = tempfile.mkstemp(suffix=ext)
@@ -32,13 +32,14 @@ def tmp_file(ext=""):
 
 
 def save_upload(file, ext=None):
-    """ SAFE write — prevents corrupt PDF uploads """
+    """Safely write uploaded file to disk"""
     filename = secure_filename(file.filename)
     extension = ext if ext else os.path.splitext(filename)[1]
     path = tmp_file(extension)
 
     with open(path, "wb") as f_out:
         f_out.write(file.read())
+
     try:
         file.seek(0)
     except:
@@ -157,12 +158,12 @@ def jpg_to_pdf():
         return abort(400, "No files selected")
 
     images = []
-    temp_paths = []
+    saved = []
 
     try:
         for f in files:
             p = save_upload(f)
-            temp_paths.append(p)
+            saved.append(p)
             img = Image.open(p).convert("RGB")
             images.append(img)
 
@@ -172,12 +173,12 @@ def jpg_to_pdf():
         return send_file(out, as_attachment=True, download_name="output.pdf")
 
     finally:
-        for p in temp_paths:
+        for p in saved:
             cleanup(p)
 
 
 # --------------------------------------------------------
-# 5 — PDF → JPG  (single merged JPG)
+# 5 — PDF → JPG (Merged Single Image)
 # --------------------------------------------------------
 @app.post("/pdf-to-jpg")
 def pdf_to_jpg():
@@ -191,14 +192,14 @@ def pdf_to_jpg():
         pages = convert_from_path(pdf, dpi=200)
 
         if not pages:
-            return abort(400, "Could not read PDF pages")
+            return abort(400, "Failed to read PDF")
 
         imgs = [p.convert("RGB") for p in pages]
 
         total_height = sum(img.height for img in imgs)
         max_width = max(img.width for img in imgs)
 
-        merged = Image.new("RGB", (max_width, total_height), (255, 255, 255))
+        merged = Image.new("RGB", (max_width, total_height), "white")
 
         y = 0
         for img in imgs:
@@ -215,7 +216,7 @@ def pdf_to_jpg():
 
 
 # --------------------------------------------------------
-# 6 — Merge PDFs (best + correct way)
+# 6 — Merge PDF
 # --------------------------------------------------------
 @app.post("/merge-pdf")
 def merge_pdf():
@@ -230,6 +231,7 @@ def merge_pdf():
         for f in files:
             if not f.filename.lower().endswith(".pdf"):
                 return abort(400, "All files must be PDF")
+
             p = save_upload(f, ".pdf")
             saved.append(p)
             merger.append(p)
@@ -279,6 +281,7 @@ def split_pdf():
         zip_path = tmp_file(".zip")
         import zipfile
         with zipfile.ZipFile(zip_path, "w") as z:
+
             for p in pages:
                 w = PdfWriter()
                 w.add_page(reader.pages[p - 1])
@@ -302,7 +305,7 @@ def split_pdf():
 @app.post("/rotate-pdf")
 def rotate_pdf():
     f = request.files.get("file")
-    angle = int(request.form.get("angle", "90"))
+    angle = int(request.form.get("angle", 90))
 
     if not f:
         return abort(400, "No file")
@@ -342,7 +345,7 @@ def compress_pdf():
 
     try:
         try:
-            p = pikepdf.open(pdf, allow_overwriting_input=True)
+            p = pikepdf.open(pdf)
         except Exception as e:
             return abort(400, f"Invalid or damaged PDF: {str(e)}")
 
@@ -443,8 +446,8 @@ def extract_text():
                 t = page.extract_text() or ""
                 text.append(t)
 
-        full_text = "\n\n--- PAGE BREAK ---\n\n".join(text)
-        return jsonify({"text": full_text})
+        full = "\n\n--- PAGE BREAK ---\n\n".join(text)
+        return jsonify({"text": full})
 
     finally:
         cleanup(pdf)
