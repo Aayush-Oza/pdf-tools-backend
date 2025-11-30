@@ -12,18 +12,21 @@ from pdf2image import convert_from_path
 import pikepdf
 from PyPDF2 import PdfReader, PdfWriter, PdfMerger
 import pdfplumber
+import zipfile
+import shutil
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-# Allow poppler inside Docker
+# Poppler + PATH fix for Render
 os.environ["PATH"] += ":/usr/bin:/usr/local/bin"
+POPPLER_PATH = "/usr/bin"
 
-app.config['MAX_CONTENT_LENGTH'] = 200 * 1024 * 1024  # 200 MB
+app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024
 
 
 # --------------------------------------------------------
-# Utility Helpers
+# Utility helpers
 # --------------------------------------------------------
 def tmp_file(ext=""):
     fd, path = tempfile.mkstemp(suffix=ext)
@@ -32,18 +35,13 @@ def tmp_file(ext=""):
 
 
 def save_upload(file, ext=None):
-    """Safely write uploaded file to disk"""
     filename = secure_filename(file.filename)
     extension = ext if ext else os.path.splitext(filename)[1]
     path = tmp_file(extension)
 
-    with open(path, "wb") as f_out:
-        f_out.write(file.read())
-
-    try:
-        file.seek(0)
-    except:
-        pass
+    file.stream.seek(0)
+    with open(path, "wb") as f:
+        f.write(file.stream.read())
 
     return path
 
@@ -52,14 +50,14 @@ def cleanup(path):
     try:
         if os.path.isdir(path):
             shutil.rmtree(path)
-        else:
+        elif os.path.isfile(path):
             os.remove(path)
     except:
         pass
 
 
 # --------------------------------------------------------
-# 1 — PDF → Word
+# 1 - PDF → Word
 # --------------------------------------------------------
 @app.post("/pdf-to-word")
 def pdf_to_word():
@@ -74,14 +72,17 @@ def pdf_to_word():
         cv = Converter(pdf)
         cv.convert(out_docx)
         cv.close()
-        return send_file(out_docx, as_attachment=True, download_name="output.docx")
+
+        return send_file(out_docx, as_attachment=True,
+                         download_name="output.docx",
+                         mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
     finally:
         cleanup(pdf)
         cleanup(out_docx)
 
 
 # --------------------------------------------------------
-# 2 — Word → PDF
+# 2 - Word → PDF
 # --------------------------------------------------------
 @app.post("/word-to-pdf")
 def word_to_pdf():
@@ -98,24 +99,24 @@ def word_to_pdf():
 
     try:
         subprocess.run(
-            ["libreoffice", "--headless", "--convert-to", "pdf", "--outdir", out_dir, doc],
+            ["libreoffice", "--headless", "--convert-to", "pdf",
+             "--outdir", out_dir, doc],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             check=True
         )
 
         base = os.path.splitext(os.path.basename(doc))[0]
-        out_pdf = os.path.join(out_dir, base + ".pdf")
+        out_pdf = os.path.join(out_dir, f"{base}.pdf")
 
         return send_file(out_pdf, as_attachment=True, download_name="output.pdf")
-
     finally:
         cleanup(doc)
         cleanup(out_dir)
 
 
 # --------------------------------------------------------
-# 3 — PPT → PDF
+# 3 - PPT → PDF
 # --------------------------------------------------------
 @app.post("/ppt-to-pdf")
 def ppt_to_pdf():
@@ -132,24 +133,24 @@ def ppt_to_pdf():
 
     try:
         subprocess.run(
-            ["libreoffice", "--headless", "--convert-to", "pdf", "--outdir", out_dir, ppt],
+            ["libreoffice", "--headless", "--convert-to", "pdf",
+             "--outdir", out_dir, ppt],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             check=True
         )
 
         base = os.path.splitext(os.path.basename(ppt))[0]
-        out_pdf = os.path.join(out_dir, base + ".pdf")
+        out_pdf = os.path.join(out_dir, f"{base}.pdf")
 
         return send_file(out_pdf, as_attachment=True, download_name="output.pdf")
-
     finally:
         cleanup(ppt)
         cleanup(out_dir)
 
 
 # --------------------------------------------------------
-# 4 — JPG → PDF
+# 4 - JPG → PDF
 # --------------------------------------------------------
 @app.post("/jpg-to-pdf")
 def jpg_to_pdf():
@@ -167,10 +168,10 @@ def jpg_to_pdf():
             img = Image.open(p).convert("RGB")
             images.append(img)
 
-        out = tmp_file(".pdf")
-        images[0].save(out, save_all=True, append_images=images[1:])
+        out_pdf = tmp_file(".pdf")
+        images[0].save(out_pdf, save_all=True, append_images=images[1:])
 
-        return send_file(out, as_attachment=True, download_name="output.pdf")
+        return send_file(out_pdf, as_attachment=True, download_name="output.pdf")
 
     finally:
         for p in saved:
@@ -178,7 +179,7 @@ def jpg_to_pdf():
 
 
 # --------------------------------------------------------
-# 5 — PDF → JPG (Merged Single Image)
+# 5 - PDF → JPG
 # --------------------------------------------------------
 @app.post("/pdf-to-jpg")
 def pdf_to_jpg():
@@ -189,18 +190,17 @@ def pdf_to_jpg():
     pdf = save_upload(f, ".pdf")
 
     try:
-        pages = convert_from_path(pdf, dpi=200)
+        pages = convert_from_path(pdf, dpi=200, poppler_path=POPPLER_PATH)
 
         if not pages:
             return abort(400, "Failed to read PDF")
 
+        # Merge all pages vertically
         imgs = [p.convert("RGB") for p in pages]
-
         total_height = sum(img.height for img in imgs)
         max_width = max(img.width for img in imgs)
 
         merged = Image.new("RGB", (max_width, total_height), "white")
-
         y = 0
         for img in imgs:
             merged.paste(img, (0, y))
@@ -209,14 +209,16 @@ def pdf_to_jpg():
         out_jpg = tmp_file(".jpg")
         merged.save(out_jpg, "JPEG", quality=90)
 
-        return send_file(out_jpg, as_attachment=True, download_name="output.jpg")
+        return send_file(out_jpg, as_attachment=True,
+                         download_name="output.jpg", mimetype="image/jpeg")
 
     finally:
         cleanup(pdf)
+        cleanup(out_jpg)
 
 
 # --------------------------------------------------------
-# 6 — Merge PDF
+# 6 - Merge PDF
 # --------------------------------------------------------
 @app.post("/merge-pdf")
 def merge_pdf():
@@ -236,20 +238,20 @@ def merge_pdf():
             saved.append(p)
             merger.append(p)
 
-        out = tmp_file(".pdf")
-        merger.write(out)
+        out_pdf = tmp_file(".pdf")
+        merger.write(out_pdf)
         merger.close()
 
-        return send_file(out, as_attachment=True, download_name="merged.pdf")
+        return send_file(out_pdf, as_attachment=True, download_name="merged.pdf")
 
     finally:
         for p in saved:
             cleanup(p)
-        cleanup(out)
+        cleanup(out_pdf)
 
 
 # --------------------------------------------------------
-# 7 — Split PDF
+# 7 - Split PDF
 # --------------------------------------------------------
 @app.post("/split-pdf")
 def split_pdf():
@@ -271,24 +273,23 @@ def split_pdf():
         pages = []
         for part in ranges.split(","):
             if "-" in part:
-                a, b = part.split("-")
-                pages.extend(range(int(a), int(b) + 1))
+                a, b = map(int, part.split("-"))
+                pages.extend(range(a, b + 1))
             else:
                 pages.append(int(part))
 
         pages = [p for p in pages if 1 <= p <= total]
 
         zip_path = tmp_file(".zip")
-        import zipfile
-        with zipfile.ZipFile(zip_path, "w") as z:
 
+        with zipfile.ZipFile(zip_path, "w") as z:
             for p in pages:
-                w = PdfWriter()
-                w.add_page(reader.pages[p - 1])
+                writer = PdfWriter()
+                writer.add_page(reader.pages[p - 1])
 
                 out_pdf = os.path.join(out_dir, f"page_{p}.pdf")
                 with open(out_pdf, "wb") as o:
-                    w.write(o)
+                    writer.write(o)
 
                 z.write(out_pdf, arcname=f"page_{p}.pdf")
 
@@ -300,7 +301,7 @@ def split_pdf():
 
 
 # --------------------------------------------------------
-# 8 — Rotate PDF
+# 8 - Rotate PDF
 # --------------------------------------------------------
 @app.post("/rotate-pdf")
 def rotate_pdf():
@@ -332,7 +333,7 @@ def rotate_pdf():
 
 
 # --------------------------------------------------------
-# 9 — Compress PDF
+# 9 - Compress PDF (Ghostscript)
 # --------------------------------------------------------
 @app.post("/compress-pdf")
 def compress_pdf():
@@ -340,27 +341,41 @@ def compress_pdf():
     if not f:
         return abort(400, "No file")
 
-    pdf = save_upload(f, ".pdf")
-    out_pdf = tmp_file(".pdf")
+    input_pdf = save_upload(f, ".pdf")
+    output_pdf = tmp_file(".pdf")
 
     try:
-        try:
-            p = pikepdf.open(pdf)
-        except Exception as e:
-            return abort(400, f"Invalid or damaged PDF: {str(e)}")
+        gs = shutil.which("gs")
+        if not gs:
+            return abort(500, "Ghostscript is missing on server")
 
-        p.save(out_pdf, optimize_streams=True, linearize=True)
-        p.close()
+        cmd = [
+            gs,
+            "-sDEVICE=pdfwrite",
+            "-dCompatibilityLevel=1.4",
+            "-dPDFSETTINGS=/ebook",
+            "-dNOPAUSE",
+            "-dQUIET",
+            "-dBATCH",
+            f"-sOutputFile={output_pdf}",
+            input_pdf,
+        ]
 
-        return send_file(out_pdf, as_attachment=True, download_name="compressed.pdf")
+        subprocess.run(cmd, check=True)
+
+        return send_file(output_pdf, as_attachment=True,
+                         download_name="compressed.pdf", mimetype="application/pdf")
+
+    except subprocess.CalledProcessError:
+        return abort(500, "Compression failed")
 
     finally:
-        cleanup(pdf)
-        cleanup(out_pdf)
+        cleanup(input_pdf)
+        cleanup(output_pdf)
 
 
 # --------------------------------------------------------
-# 10 — Protect PDF
+# 10 - Protect PDF
 # --------------------------------------------------------
 @app.post("/protect-pdf")
 def protect_pdf():
@@ -393,7 +408,7 @@ def protect_pdf():
 
 
 # --------------------------------------------------------
-# 11 — Unlock PDF
+# 11 - Unlock PDF
 # --------------------------------------------------------
 @app.post("/unlock-pdf")
 def unlock_pdf():
@@ -429,7 +444,7 @@ def unlock_pdf():
 
 
 # --------------------------------------------------------
-# 12 — Extract Text
+# 12 - Extract Text
 # --------------------------------------------------------
 @app.post("/extract-text")
 def extract_text():
@@ -443,11 +458,9 @@ def extract_text():
         text = []
         with pdfplumber.open(pdf) as p:
             for page in p.pages:
-                t = page.extract_text() or ""
-                text.append(t)
+                text.append(page.extract_text() or "")
 
-        full = "\n\n--- PAGE BREAK ---\n\n".join(text)
-        return jsonify({"text": full})
+        return jsonify({"text": "\n\n--- PAGE BREAK ---\n\n".join(text)})
 
     finally:
         cleanup(pdf)
