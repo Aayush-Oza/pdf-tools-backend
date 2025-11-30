@@ -12,11 +12,10 @@ RUN apt-get update && \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-
-COPY . /app
+COPY . .
 
 RUN pip install --no-cache-dir -r requirements.txt
 
 EXPOSE 5000
 
-CMD ["sh", "-c", "gunicorn app:app -b 0.0.0.0:${PORT:-5000} --workers 2 --timeout 200"]
+CMD ["gunicorn", "app:app", "-b", "0.0.0.0:5000", "--workers", "2", "--timeout", "200"]
