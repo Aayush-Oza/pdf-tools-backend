@@ -172,35 +172,42 @@ def jpg_to_pdf():
 def pdf_to_jpg():
     f = request.files.get("file")
     if not f:
-        return abort(400, "No file")
+        return abort(400, "No file uploaded")
 
     pdf = save_upload(f, ".pdf")
-    out_dir = tempfile.mkdtemp()
 
     try:
-        pages = convert_from_path(pdf, dpi=200, output_folder=out_dir, fmt="jpeg")
+        # Convert PDF to list of images
+        pages = convert_from_path(pdf, dpi=200)
 
-        # Single page → return the one image
-        if len(pages) == 1:
-            img_path = os.path.join(out_dir, "page.jpg")
-            pages[0].save(img_path, "JPEG")
-            return send_file(img_path, as_attachment=True, download_name="page.jpg")
+        # Convert each page to RGB
+        imgs = [p.convert("RGB") for p in pages]
 
-        # Multiple pages → zip
-        zip_path = tmp_file(".zip")
-        import zipfile
+        # Calculate final JPG size
+        widths = [i.width for i in imgs]
+        heights = [i.height for i in imgs]
 
-        with zipfile.ZipFile(zip_path, "w") as z:
-            for i, page in enumerate(pages, 1):
-                p = os.path.join(out_dir, f"page_{i}.jpg")
-                page.save(p, "JPEG")
-                z.write(p, arcname=f"page_{i}.jpg")
+        total_height = sum(heights)
+        max_width = max(widths)
 
-        return send_file(zip_path, as_attachment=True, download_name="pages.zip")
+        # Create one merged JPG
+        merged = Image.new("RGB", (max_width, total_height), (255, 255, 255))
+
+        y = 0
+        for img in imgs:
+            merged.paste(img, (0, y))
+            y += img.height
+
+        out_jpg = tmp_file(".jpg")
+        merged.save(out_jpg, "JPEG", quality=90)
+
+        return send_file(out_jpg, as_attachment=True, download_name="output.jpg")
+
+    except Exception as e:
+        return abort(500, f"Conversion failed: {str(e)}")
 
     finally:
         cleanup(pdf)
-        cleanup(out_dir)
 
 
 # --------------------------------------------------------
@@ -212,7 +219,7 @@ def merge_pdf():
     if not files:
         return abort(400, "No files")
 
-    writer = PdfWriter()
+    writer = PdfWriter(strict=False)   # <-- FIXED
     saved = []
 
     try:
@@ -334,7 +341,7 @@ def compress_pdf():
     out_pdf = tmp_file(".pdf")
 
     try:
-        p = pikepdf.open(pdf)
+        p = pikepdf.open(pdf, allow_overwriting_input=True)  # <-- FIXED
         p.save(out_pdf, optimize_streams=True, linearize=True)
         p.close()
 
