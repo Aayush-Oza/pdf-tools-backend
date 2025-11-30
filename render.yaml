@@ -2,14 +2,19 @@ services:
   - type: web
     name: pdf-tools-backend
     env: python
-    buildCommand: |
-      apt-get update
-      apt-get install -y libreoffice
-      apt-get install -y poppler-utils
-      apt-get install -y ghostscript
-      apt-get install -y ttf-mscorefonts-installer
-      pip install -r requirements.txt
-    startCommand: gunicorn app:app
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --timeout 200
+    plan: free
+    region: oregon
+    buildFilter:
+      paths:
+        - app.py
+        - requirements.txt
+        - apt.txt
+        - build.sh
     envVars:
-      - key: PYTHONUNBUFFERED
-        value: "1"
+      PYTHONUNBUFFERED: true
+    packages:
+      apt:
+        - libreoffice
+        - poppler-utils
