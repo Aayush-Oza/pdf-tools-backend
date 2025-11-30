@@ -66,18 +66,45 @@ def pdf_to_word():
         return abort(400, "No file")
 
     pdf = save_upload(f, ".pdf")
+    unlocked_pdf = tmp_file(".pdf")
     out_docx = tmp_file(".docx")
 
     try:
-        cv = Converter(pdf)
+        # -------------------------
+        # CHECK IF PDF IS ENCRYPTED
+        # -------------------------
+        reader = PdfReader(pdf)
+
+        if reader.is_encrypted:
+            try:
+                # Try decrypt with empty password
+                reader.decrypt("")
+                writer = PdfWriter()
+
+                for page in reader.pages:
+                    writer.add_page(page)
+
+                with open(unlocked_pdf, "wb") as f2:
+                    writer.write(f2)
+
+                pdf_to_use = unlocked_pdf
+            except:
+                return abort(400, "PDF is password protected. Use Unlock tool first.")
+        else:
+            pdf_to_use = pdf
+
+        # -------------------------
+        # CONVERT PDF → WORD
+        # -------------------------
+        cv = Converter(pdf_to_use)
         cv.convert(out_docx)
         cv.close()
 
-        return send_file(out_docx, as_attachment=True,
-                         download_name="output.docx",
-                         mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+        return send_file(out_docx, as_attachment=True, download_name="output.docx")
+
     finally:
         cleanup(pdf)
+        cleanup(unlocked_pdf)
         cleanup(out_docx)
 
 
