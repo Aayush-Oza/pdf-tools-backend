@@ -1,0 +1,10 @@
+flask
+flask-cors
+pdfplumber
+PyPDF2
+pikepdf
+pdf2image
+pdf2docx
+pillow
+pypdfium2
+gunicorn

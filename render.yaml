@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: pdf-tools-backend
+    env: python
+    buildCommand: |
+      apt-get update
+      apt-get install -y libreoffice
+      apt-get install -y poppler-utils
+      apt-get install -y ghostscript
+      apt-get install -y ttf-mscorefonts-installer
+      pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
