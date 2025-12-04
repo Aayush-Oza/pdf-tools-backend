@@ -5,7 +5,7 @@ import shutil
 import subprocess
 from werkzeug.utils import secure_filename
 from flask_cors import CORS
-
+from flask import after_this_request, current_app
 from pdf2docx import Converter
 from PIL import Image
 from pdf2image import convert_from_path
@@ -63,50 +63,105 @@ def cleanup(path):
 def pdf_to_word():
     f = request.files.get("file")
     if not f:
-        return abort(400, "No file")
+        return abort(400, "No file uploaded")
 
     pdf = save_upload(f, ".pdf")
     unlocked_pdf = tmp_file(".pdf")
     out_docx = tmp_file(".docx")
 
+    # register cleanup of generated files AFTER response is created
+    @after_this_request
+    def _cleanup_response(response):
+        try:
+            cleanup(pdf)
+            cleanup(unlocked_pdf)
+            cleanup(out_docx)
+        except Exception as e:
+            current_app.logger.exception("Cleanup failed: %s", e)
+        return response
+
     try:
         # -------------------------
-        # CHECK IF PDF IS ENCRYPTED
+        # Try to open and detect encryption
         # -------------------------
-        reader = PdfReader(pdf)
+        try:
+            reader = PdfReader(pdf)
+        except Exception as e:
+            current_app.logger.exception("PdfReader failed to open PDF")
+            return jsonify({"error": "Unable to open PDF (possibly corrupted).", "details": str(e)}), 400
 
-        if reader.is_encrypted:
+        pdf_to_use = pdf
+
+        # If encrypted -> attempt to remove owner password with pikepdf (stronger)
+        if getattr(reader, "is_encrypted", False):
             try:
-                # Try decrypt with empty password
-                reader.decrypt("")
-                writer = PdfWriter()
-
-                for page in reader.pages:
-                    writer.add_page(page)
-
-                with open(unlocked_pdf, "wb") as f2:
-                    writer.write(f2)
-
-                pdf_to_use = unlocked_pdf
-            except:
-                return abort(400, "PDF is password protected. Use Unlock tool first.")
-        else:
-            pdf_to_use = pdf
+                # Try trivial decrypt via PyPDF2 first (empty password)
+                try:
+                    reader.decrypt("")
+                    writer = PdfWriter()
+                    for page in reader.pages:
+                        writer.add_page(page)
+                    with open(unlocked_pdf, "wb") as f2:
+                        writer.write(f2)
+                    pdf_to_use = unlocked_pdf
+                except Exception:
+                    # fallback to pikepdf (can remove owner-passwords)
+                    try:
+                        with pikepdf.open(pdf, password="") as pp:
+                            pp.save(unlocked_pdf)
+                        pdf_to_use = unlocked_pdf
+                    except pikepdf._qpdf.PasswordError:
+                        return jsonify({"error": "PDF is password protected. Use Unlock tool first."}), 400
+                    except Exception as e:
+                        current_app.logger.exception("pikepdf unlock failed")
+                        return jsonify({"error": "Failed to unlock PDF", "details": str(e)}), 400
+            except Exception as e:
+                current_app.logger.exception("Encryption handling failed")
+                return jsonify({"error": "Failed processing encrypted PDF", "details": str(e)}), 400
 
         # -------------------------
-        # CONVERT PDF → WORD
+        # Quick check: is PDF image-only (scanned)?
         # -------------------------
-        cv = Converter(pdf_to_use)
-        cv.convert(out_docx)
-        cv.close()
+        try:
+            text_found = False
+            with pdfplumber.open(pdf_to_use) as p:
+                # check first 2 pages for visible text
+                for page in p.pages[:2]:
+                    txt = (page.extract_text() or "").strip()
+                    if txt:
+                        text_found = True
+                        break
+        except Exception as e:
+            current_app.logger.exception("pdfplumber check failed; continuing to conversion")
 
+        if not text_found:
+            # it's likely scanned or image only — pdf2docx doesn't do OCR
+            return jsonify({
+                "error": "PDF appears to be image/scanned (no selectable text).",
+                "suggestion": "Use an OCR step first (Tesseract) or convert PDF->JPG and run OCR."
+            }), 400
+
+        # -------------------------
+        # Convert PDF -> DOCX
+        # -------------------------
+        try:
+            cv = Converter(pdf_to_use)
+            # use convert with explicit start/end to avoid hidden failures
+            cv.convert(out_docx, start=0, end=None)
+            cv.close()
+        except Exception as e:
+            # log stacktrace and return message to client
+            current_app.logger.exception("pdf2docx conversion failed")
+            return jsonify({"error": "Conversion failed", "details": str(e)}), 500
+
+        # -------------------------
+        # Send file (after_this_request will cleanup)
+        # -------------------------
         return send_file(out_docx, as_attachment=True, download_name="output.docx")
 
     finally:
-        cleanup(pdf)
-        cleanup(unlocked_pdf)
-        cleanup(out_docx)
-
+        # do not remove output files here — cleanup happens in after_this_request
+        pass
 
 # --------------------------------------------------------
 # 2 - Word → PDF
@@ -125,18 +180,37 @@ def word_to_pdf():
     out_dir = tempfile.mkdtemp()
 
     try:
+        # STEP 1 → Convert DOCX → ODT
         subprocess.run(
-            ["libreoffice", "--headless", "--convert-to", "pdf",
-             "--outdir", out_dir, doc],
+            [
+                "libreoffice", "--headless",
+                "--convert-to", "odt",
+                "--outdir", out_dir, doc
+            ],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             check=True
         )
 
         base = os.path.splitext(os.path.basename(doc))[0]
-        out_pdf = os.path.join(out_dir, f"{base}.pdf")
+        odt_path = os.path.join(out_dir, f"{base}.odt")
 
+        # STEP 2 → Convert ODT → PDF (HIGH QUALITY)
+        subprocess.run(
+            [
+                "libreoffice", "--headless",
+                "--convert-to",
+                "pdf:writer_pdf_Export:EmbedStandardFonts=true;ReduceImageResolution=false",
+                "--outdir", out_dir, odt_path
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True
+        )
+
+        out_pdf = os.path.join(out_dir, f"{base}.pdf")
         return send_file(out_pdf, as_attachment=True, download_name="output.pdf")
+
     finally:
         cleanup(doc)
         cleanup(out_dir)
@@ -192,17 +266,28 @@ def jpg_to_pdf():
         for f in files:
             p = save_upload(f)
             saved.append(p)
+
             img = Image.open(p).convert("RGB")
+            # Increase DPI & preserve clarity
+            img.info["dpi"] = (300, 300)
             images.append(img)
 
         out_pdf = tmp_file(".pdf")
-        images[0].save(out_pdf, save_all=True, append_images=images[1:])
+
+        images[0].save(
+            out_pdf,
+            save_all=True,
+            append_images=images[1:],
+            quality=100,         # max quality
+            dpi=(300, 300)       # print quality
+        )
 
         return send_file(out_pdf, as_attachment=True, download_name="output.pdf")
 
     finally:
         for p in saved:
             cleanup(p)
+
 
 
 # --------------------------------------------------------
