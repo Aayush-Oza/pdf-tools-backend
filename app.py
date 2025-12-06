@@ -5,6 +5,12 @@ import shutil
 import subprocess
 from werkzeug.utils import secure_filename
 from flask_cors import CORS
+# SPEED BOOST: Preload LibreOffice in background for faster conversions
+subprocess.Popen(
+    ["libreoffice", "--headless"],
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL
+)
 
 from pdf2docx import Converter
 from PIL import Image
@@ -14,6 +20,8 @@ import pikepdf
 from PyPDF2 import PdfReader, PdfWriter, PdfMerger
 import pdfplumber
 import zipfile
+import logging
+logging.getLogger('werkzeug').setLevel(logging.ERROR)
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
@@ -47,7 +55,9 @@ def save_upload(file, ext: str | None = None) -> str:
 
     file.stream.seek(0)
     with open(path, "wb") as f:
-        f.write(file.stream.read())
+        for chunk in iter(lambda: file.stream.read(4096), b""):
+            f.write(chunk)
+
 
     return path
 
@@ -78,7 +88,10 @@ def ocr_pdf_to_text(pdf_path: str, dpi: int = 300) -> str:
     texts = []
     for i, page in enumerate(pages, start=1):
         try:
-            text = pytesseract.image_to_string(page)
+            text = pytesseract.image_to_string(
+                page,
+                config="--oem 1 --psm 3 -l eng"
+            )
         except Exception as e:
             current_app.logger.exception("Tesseract OCR failed on page %s", i)
             text = ""
@@ -112,7 +125,7 @@ def pdf_to_word():
         # TRY OPENING PDF (check encryption)
         # ---------------------------------------------------
         try:
-            reader = PdfReader(pdf)
+            reader = PdfReader(pdf, strict=False)
         except Exception as e:
             return jsonify({
                 "error": "Unable to open PDF (possibly corrupted).",
@@ -343,39 +356,33 @@ def pdf_to_jpg():
         return abort(400, "No file uploaded")
 
     pdf = save_upload(f, ".pdf")
-    out_jpg = None
+    out_dir = tempfile.mkdtemp()
+    zip_path = tmp_file(".zip")
 
     try:
-        # Slightly higher DPI for better clarity
-        pages = convert_from_path(pdf, dpi=350, poppler_path=POPPLER_PATH)
+        # Faster + enough quality
+        pages = convert_from_path(pdf, dpi=200, poppler_path=POPPLER_PATH, thread_count=4)
 
-        if not pages:
-            return abort(400, "Failed to read PDF")
+        jpg_files = []
 
-        imgs = [p.convert("RGB") for p in pages]
-        total_height = sum(img.height for img in imgs)
-        max_width = max(img.width for img in imgs)
+        for i, page in enumerate(pages, start=1):
+            img = page.convert("RGB")
 
-        merged = Image.new("RGB", (max_width, total_height), "white")
-        y = 0
-        for img in imgs:
-            merged.paste(img, (0, y))
-            y += img.height
+            out_jpg = os.path.join(out_dir, f"page_{i}.jpg")
+            img.save(out_jpg, "JPEG", quality=90, optimize=True)
+            jpg_files.append(out_jpg)
 
-        out_jpg = tmp_file(".jpg")
-        merged.save(out_jpg, "JPEG", quality=90)
+        # Zip all JPGs
+        with zipfile.ZipFile(zip_path, "w") as z:
+            for p in jpg_files:
+                z.write(p, arcname=os.path.basename(p))
 
-        return send_file(
-            out_jpg,
-            as_attachment=True,
-            download_name="output.jpg",
-            mimetype="image/jpeg"
-        )
+        return send_file(zip_path, as_attachment=True, download_name="images.zip")
 
     finally:
         cleanup(pdf)
-        if out_jpg:
-            cleanup(out_jpg)
+        cleanup(out_dir)
+        cleanup(zip_path)
 
 
 # --------------------------------------------------------
@@ -431,7 +438,7 @@ def split_pdf():
     zip_path = None
 
     try:
-        reader = PdfReader(pdf)
+        reader = PdfReader(pdf, strict=False)
         total = len(reader.pages)
 
         pages = []
@@ -487,7 +494,7 @@ def rotate_pdf():
     out_pdf = tmp_file(".pdf")
 
     try:
-        reader = PdfReader(pdf)
+        reader = PdfReader(pdf, strict=False)
         writer = PdfWriter()
 
         for page in reader.pages:
@@ -569,7 +576,7 @@ def protect_pdf():
     out_pdf = tmp_file(".pdf")
 
     try:
-        reader = PdfReader(pdf)
+        reader = PdfReader(pdf, strict=False)
         writer = PdfWriter()
 
         for p in reader.pages:
@@ -602,7 +609,7 @@ def unlock_pdf():
     out_pdf = tmp_file(".pdf")
 
     try:
-        reader = PdfReader(pdf)
+        reader = PdfReader(pdf, strict=False)
 
         if reader.is_encrypted:
             if not pwd:
