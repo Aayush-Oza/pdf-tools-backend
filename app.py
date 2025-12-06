@@ -97,23 +97,20 @@ def pdf_to_word():
     unlocked_pdf = tmp_file(".pdf")
     out_docx = tmp_file(".docx")
 
-    # cleanup after response
     @after_this_request
     def _cleanup_response(response):
-        try:
-            cleanup(pdf)
-            cleanup(unlocked_pdf)
-            cleanup(out_docx)
-        except Exception as e:
-            current_app.logger.exception("Cleanup failed: %s", e)
+        cleanup(pdf)
+        cleanup(unlocked_pdf)
+        cleanup(out_docx)
         return response
 
     try:
-        # Try open with PyPDF2
+        # ---------------------------------------------------
+        # TRY OPENING PDF (check encryption)
+        # ---------------------------------------------------
         try:
             reader = PdfReader(pdf)
         except Exception as e:
-            current_app.logger.exception("PdfReader failed to open PDF")
             return jsonify({
                 "error": "Unable to open PDF (possibly corrupted).",
                 "details": str(e)
@@ -121,11 +118,12 @@ def pdf_to_word():
 
         pdf_to_use = pdf
 
-        # Handle encryption
+        # ---------------------------------------------------
+        # HANDLE ENCRYPTED PDF
+        # ---------------------------------------------------
         if getattr(reader, "is_encrypted", False):
             try:
                 try:
-                    # Try empty password
                     reader.decrypt("")
                     writer = PdfWriter()
                     for page in reader.pages:
@@ -134,79 +132,55 @@ def pdf_to_word():
                         writer.write(f2)
                     pdf_to_use = unlocked_pdf
                 except Exception:
-                    # Fallback: pikepdf (owner password removal)
                     try:
+                        import pikepdf
                         with pikepdf.open(pdf, password="") as pp:
                             pp.save(unlocked_pdf)
                         pdf_to_use = unlocked_pdf
                     except pikepdf._qpdf.PasswordError:
-                        return jsonify({
-                            "error": "PDF is password protected. Use Unlock tool first."
-                        }), 400
-                    except Exception as e:
-                        current_app.logger.exception("pikepdf unlock failed")
-                        return jsonify({
-                            "error": "Failed to unlock PDF",
-                            "details": str(e)
-                        }), 400
+                        return jsonify({"error": "PDF is password protected. Use Unlock tool first."}), 400
             except Exception as e:
-                current_app.logger.exception("Encryption handling failed")
-                return jsonify({
-                    "error": "Failed processing encrypted PDF",
-                    "details": str(e)
-                }), 400
+                return jsonify({"error": "Failed processing encrypted PDF", "details": str(e)}), 400
 
-        # Quick check: is there real text?
-        is_image_only = False
-        try:
-            text_found = False
-            with pdfplumber.open(pdf_to_use) as p:
-                for page in p.pages[:2]:
-                    txt = (page.extract_text() or "").strip()
-                    if txt:
-                        text_found = True
-                        break
-            is_image_only = not text_found
-        except Exception as e:
-            current_app.logger.exception("pdfplumber check failed; continuing anyway")
-            # if pdfplumber fails, we just try normal conversion
+        # ---------------------------------------------------
+        # FIRST TRY NORMAL PDF → WORD (pdf2docx)
+        # ---------------------------------------------------
+        from docx import Document
 
-        # If image-only → OCR to DOCX
-        if is_image_only:
-            from docx import Document  # python-docx
-
-            try:
-                ocr_text = ocr_pdf_to_text(pdf_to_use)
-            except Exception as e:
-                return jsonify({
-                    "error": "PDF appears to be scanned and OCR failed.",
-                    "details": str(e)
-                }), 500
-
-            doc = Document()
-            # Simple block paragraphs
-            for block in ocr_text.split("\n\n"):
-                block = block.strip()
-                if block:
-                    doc.add_paragraph(block)
-            doc.save(out_docx)
-
-            return send_file(out_docx, as_attachment=True, download_name="output.docx")
-
-        # Normal text PDF → use pdf2docx for layout
         try:
             cv = Converter(pdf_to_use)
             cv.convert(out_docx, start=0, end=None, layout_mode=True)
-
             cv.close()
+
+            # Check if conversion produced text (not empty)
+            doc_check = Document(out_docx)
+            if len(doc_check.paragraphs) > 0:
+                return send_file(out_docx, as_attachment=True, download_name="output.docx")
+
+        except Exception:
+            pass  # pdf2docx failed → fallback to OCR
+
+        # ---------------------------------------------------
+        # FALLBACK TO OCR IF pdf2docx FAILED
+        # ---------------------------------------------------
+        try:
+            ocr_text = ocr_pdf_to_text(pdf_to_use)
         except Exception as e:
-            current_app.logger.exception("pdf2docx conversion failed")
-            return jsonify({"error": "Conversion failed", "details": str(e)}), 500
+            return jsonify({
+                "error": "OCR failed. PDF may be damaged.",
+                "details": str(e)
+            }), 500
+
+        doc = Document()
+        for block in ocr_text.split("\n\n"):
+            block = block.strip()
+            if block:
+                doc.add_paragraph(block)
+        doc.save(out_docx)
 
         return send_file(out_docx, as_attachment=True, download_name="output.docx")
 
     finally:
-        # real cleanup is in after_this_request
         pass
 
 
@@ -262,44 +236,89 @@ def word_to_pdf():
 
 
 # --------------------------------------------------------
-# 3 - PPT → PDF
+# PERFECT + COMPRESSED PPT → PDF  (Slide → Image → PDF)
 # --------------------------------------------------------
-@app.post("/ppt-to-pdf")
-def ppt_to_pdf():
+@app.post("/ppt-to-pdf-perfect")
+def ppt_to_pdf_perfect():
     f = request.files.get("file")
     if not f:
-        return abort(400, "No file")
+        return abort(400, "No file uploaded")
 
     ext = os.path.splitext(f.filename)[1].lower()
     if ext not in [".ppt", ".pptx"]:
         return abort(400, "Upload a PPT/PPTX file")
 
     ppt = save_upload(f, ext)
-    out_dir = tempfile.mkdtemp()
+    temp_dir = tempfile.mkdtemp()
+    out_pdf = tmp_file(".pdf")
 
     try:
-        # High-quality export profile (better than default)
+        # ----------------------------------------------------
+        # 1. Export each slide as a PNG using LibreOffice
+        # ----------------------------------------------------
         subprocess.run(
             [
-                "libreoffice", "--headless",
-                "--convert-to",
-                "pdf:impress_pdf_Export:SelectPdfVersion=1;Quality=100;ImageCompression=0;LosslessImageCompression=true;UseTaggedPDF=true",
-                "--outdir", out_dir,
-                ppt,
+                "libreoffice",
+                "--headless",
+                "--convert-to", "png",
+                "--outdir", temp_dir,
+                ppt
             ],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=True
         )
 
-        base = os.path.splitext(os.path.basename(ppt))[0]
-        out_pdf = os.path.join(out_dir, f"{base}.pdf")
+        # Get PNG slide images
+        imgs = sorted(
+            os.path.join(temp_dir, name)
+            for name in os.listdir(temp_dir)
+            if name.lower().endswith(".png")
+        )
+
+        if not imgs:
+            return abort(500, "Failed to export slides.")
+
+        # ----------------------------------------------------
+        # 2. Convert PNG → compressed JPEG (smaller PDF size)
+        # ----------------------------------------------------
+        slide_images = []
+        from io import BytesIO
+
+        for img_path in imgs:
+            img = Image.open(img_path).convert("RGB")
+
+            # Reduce slide resolution a bit to reduce PDF size
+            img = img.resize(
+                (int(img.width * 0.85), int(img.height * 0.85)),
+                Image.LANCZOS
+            )
+
+            # Compress to JPEG buffer
+            buf = BytesIO()
+            img.save(buf, format="JPEG", quality=85)   # balanced quality
+            buf.seek(0)
+
+            # Reload as Pillow image for PDF creation
+            compressed = Image.open(buf)
+            slide_images.append(compressed)
+
+        # ----------------------------------------------------
+        # 3. Save all slides into a single PDF
+        # ----------------------------------------------------
+        slide_images[0].save(
+            out_pdf,
+            "PDF",
+            resolution=150,             # lower DPI → smaller size
+            save_all=True,
+            append_images=slide_images[1:],
+        )
 
         return send_file(out_pdf, as_attachment=True, download_name="output.pdf")
 
     finally:
         cleanup(ppt)
-        cleanup(out_dir)
+        cleanup(temp_dir) 
 
 
 # --------------------------------------------------------
@@ -674,12 +693,7 @@ def extract_text():
                 line for line in ocr_raw.split("\n")
                 if not line.strip().startswith("--- PAGE")
             )           
-            paragraphs = [
-                para.strip()
-                for para in ocr_raw.split("\n")
-                if para.strip()
-            ]
-
+            paragraphs = [p.strip() for p in ocr_raw.split("\n\n") if p.strip()]
             formatted = "\n\n".join(paragraphs)
 
             return jsonify({"text": formatted})
