@@ -236,10 +236,10 @@ def word_to_pdf():
 
 
 # --------------------------------------------------------
-# PERFECT + COMPRESSED PPT → PDF  (Slide → Image → PDF)
+# PERFECT PPT → PDF  (NO formatting change, Not compressed)
 # --------------------------------------------------------
-@app.post("/ppt-to-pdf-perfect")
-def ppt_to_pdf_perfect():
+@app.post("/ppt-to-pdf")
+def ppt_to_pdf():
     f = request.files.get("file")
     if not f:
         return abort(400, "No file uploaded")
@@ -248,77 +248,44 @@ def ppt_to_pdf_perfect():
     if ext not in [".ppt", ".pptx"]:
         return abort(400, "Upload a PPT/PPTX file")
 
-    ppt = save_upload(f, ext)
-    temp_dir = tempfile.mkdtemp()
-    out_pdf = tmp_file(".pdf")
+    ppt_path = save_upload(f, ext)
+    out_dir = tempfile.mkdtemp()
 
     try:
         # ----------------------------------------------------
-        # 1. Export each slide as a PNG using LibreOffice
+        # Direct PPT → PDF export using LibreOffice
+        # This preserves:
+        # - Exact fonts
+        # - Exact spacing & alignment
+        # - Shapes, gradients, backgrounds
+        # - Slide layout 100% accurate
         # ----------------------------------------------------
         subprocess.run(
             [
-                "libreoffice",
-                "--headless",
-                "--convert-to", "png",
-                "--outdir", temp_dir,
-                ppt
+                "libreoffice", "--headless",
+                "--convert-to",
+                "pdf:impress_pdf_Export",
+                "--outdir", out_dir,
+                ppt_path
             ],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=True
         )
 
-        # Get PNG slide images
-        imgs = sorted(
-            os.path.join(temp_dir, name)
-            for name in os.listdir(temp_dir)
-            if name.lower().endswith(".png")
-        )
+        # Construct PDF path
+        base = os.path.splitext(os.path.basename(ppt_path))[0]
+        pdf_path = os.path.join(out_dir, f"{base}.pdf")
 
-        if not imgs:
-            return abort(500, "Failed to export slides.")
+        if not os.path.exists(pdf_path):
+            return abort(500, "Failed to export PDF from PPT.")
 
-        # ----------------------------------------------------
-        # 2. Convert PNG → compressed JPEG (smaller PDF size)
-        # ----------------------------------------------------
-        slide_images = []
-        from io import BytesIO
-
-        for img_path in imgs:
-            img = Image.open(img_path).convert("RGB")
-
-            # Reduce slide resolution a bit to reduce PDF size
-            img = img.resize(
-                (int(img.width * 0.85), int(img.height * 0.85)),
-                Image.LANCZOS
-            )
-
-            # Compress to JPEG buffer
-            buf = BytesIO()
-            img.save(buf, format="JPEG", quality=85)   # balanced quality
-            buf.seek(0)
-
-            # Reload as Pillow image for PDF creation
-            compressed = Image.open(buf)
-            slide_images.append(compressed)
-
-        # ----------------------------------------------------
-        # 3. Save all slides into a single PDF
-        # ----------------------------------------------------
-        slide_images[0].save(
-            out_pdf,
-            "PDF",
-            resolution=150,             # lower DPI → smaller size
-            save_all=True,
-            append_images=slide_images[1:],
-        )
-
-        return send_file(out_pdf, as_attachment=True, download_name="output.pdf")
+        # Send perfect output
+        return send_file(pdf_path, as_attachment=True, download_name="output.pdf")
 
     finally:
-        cleanup(ppt)
-        cleanup(temp_dir) 
+        cleanup(ppt_path)
+        cleanup(out_dir)
 
 
 # --------------------------------------------------------
@@ -713,6 +680,27 @@ def extract_text():
 def home():
     return "PDF Tools Backend Running"
 
+# --------------------------------------------------------
+# GLOBAL CORS FIX FOR ALL ROUTES
+# --------------------------------------------------------
+@app.after_request
+def apply_cors(response):
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    return response
+
+@app.before_request
+def handle_options():
+    if request.method == "OPTIONS":
+        resp = app.make_response("")
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+        resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        return resp  # <-- stop request here
+
+if __name__ == "__main__":
+    app.run(debug=True)
 
 if __name__ == "__main__":
     app.run(debug=True)
