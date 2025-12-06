@@ -1,19 +1,19 @@
-from flask import Flask, request, send_file, abort, jsonify
+from flask import Flask, request, send_file, abort, jsonify, after_this_request, current_app
 import os
 import tempfile
 import shutil
 import subprocess
 from werkzeug.utils import secure_filename
 from flask_cors import CORS
-from flask import after_this_request, current_app
+
 from pdf2docx import Converter
 from PIL import Image
 from pdf2image import convert_from_path
+import pytesseract
 import pikepdf
 from PyPDF2 import PdfReader, PdfWriter, PdfMerger
 import pdfplumber
 import zipfile
-import shutil
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
@@ -22,19 +22,22 @@ CORS(app, resources={r"/*": {"origins": "*"}})
 os.environ["PATH"] += ":/usr/bin:/usr/local/bin"
 POPPLER_PATH = "/usr/bin"
 
+# 200 MB max
 app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024
 
 
 # --------------------------------------------------------
 # Utility helpers
 # --------------------------------------------------------
-def tmp_file(ext=""):
+def tmp_file(ext: str = "") -> str:
+    """Create a temp file path with given extension."""
     fd, path = tempfile.mkstemp(suffix=ext)
     os.close(fd)
     return path
 
 
-def save_upload(file, ext=None):
+def save_upload(file, ext: str | None = None) -> str:
+    """Save uploaded file object to a temp file and return its path."""
     filename = secure_filename(file.filename)
     extension = ext if ext else os.path.splitext(filename)[1]
     path = tmp_file(extension)
@@ -46,18 +49,43 @@ def save_upload(file, ext=None):
     return path
 
 
-def cleanup(path):
+def cleanup(path: str):
+    """Safely delete file or directory if it exists."""
     try:
         if os.path.isdir(path):
-            shutil.rmtree(path)
+            shutil.rmtree(path, ignore_errors=True)
         elif os.path.isfile(path):
             os.remove(path)
-    except:
+    except Exception:
+        # Do not crash app just because cleanup fails
         pass
 
 
+def ocr_pdf_to_text(pdf_path: str, dpi: int = 300) -> str:
+    """
+    OCR an image-based PDF using Tesseract via pdf2image.
+    Returns plain text with simple page separators.
+    """
+    try:
+        pages = convert_from_path(pdf_path, dpi=dpi, poppler_path=POPPLER_PATH)
+    except Exception as e:
+        current_app.logger.exception("OCR pdf2image failed")
+        raise RuntimeError(f"OCR rasterization failed: {e}")
+
+    texts = []
+    for i, page in enumerate(pages, start=1):
+        try:
+            text = pytesseract.image_to_string(page)
+        except Exception as e:
+            current_app.logger.exception("Tesseract OCR failed on page %s", i)
+            text = ""
+        texts.append(f"--- PAGE {i} ---\n{text.strip()}")
+
+    return "\n\n".join(texts).strip()
+
+
 # --------------------------------------------------------
-# 1 - PDF → Word
+# 1 - PDF → Word  (with OCR fallback)
 # --------------------------------------------------------
 @app.post("/pdf-to-word")
 def pdf_to_word():
@@ -69,7 +97,7 @@ def pdf_to_word():
     unlocked_pdf = tmp_file(".pdf")
     out_docx = tmp_file(".docx")
 
-    # register cleanup of generated files AFTER response is created
+    # cleanup after response
     @after_this_request
     def _cleanup_response(response):
         try:
@@ -81,22 +109,23 @@ def pdf_to_word():
         return response
 
     try:
-        # -------------------------
-        # Try to open and detect encryption
-        # -------------------------
+        # Try open with PyPDF2
         try:
             reader = PdfReader(pdf)
         except Exception as e:
             current_app.logger.exception("PdfReader failed to open PDF")
-            return jsonify({"error": "Unable to open PDF (possibly corrupted).", "details": str(e)}), 400
+            return jsonify({
+                "error": "Unable to open PDF (possibly corrupted).",
+                "details": str(e)
+            }), 400
 
         pdf_to_use = pdf
 
-        # If encrypted -> attempt to remove owner password with pikepdf (stronger)
+        # Handle encryption
         if getattr(reader, "is_encrypted", False):
             try:
-                # Try trivial decrypt via PyPDF2 first (empty password)
                 try:
+                    # Try empty password
                     reader.decrypt("")
                     writer = PdfWriter()
                     for page in reader.pages:
@@ -105,66 +134,83 @@ def pdf_to_word():
                         writer.write(f2)
                     pdf_to_use = unlocked_pdf
                 except Exception:
-                    # fallback to pikepdf (can remove owner-passwords)
+                    # Fallback: pikepdf (owner password removal)
                     try:
                         with pikepdf.open(pdf, password="") as pp:
                             pp.save(unlocked_pdf)
                         pdf_to_use = unlocked_pdf
                     except pikepdf._qpdf.PasswordError:
-                        return jsonify({"error": "PDF is password protected. Use Unlock tool first."}), 400
+                        return jsonify({
+                            "error": "PDF is password protected. Use Unlock tool first."
+                        }), 400
                     except Exception as e:
                         current_app.logger.exception("pikepdf unlock failed")
-                        return jsonify({"error": "Failed to unlock PDF", "details": str(e)}), 400
+                        return jsonify({
+                            "error": "Failed to unlock PDF",
+                            "details": str(e)
+                        }), 400
             except Exception as e:
                 current_app.logger.exception("Encryption handling failed")
-                return jsonify({"error": "Failed processing encrypted PDF", "details": str(e)}), 400
+                return jsonify({
+                    "error": "Failed processing encrypted PDF",
+                    "details": str(e)
+                }), 400
 
-        # -------------------------
-        # Quick check: is PDF image-only (scanned)?
-        # -------------------------
+        # Quick check: is there real text?
+        is_image_only = False
         try:
             text_found = False
             with pdfplumber.open(pdf_to_use) as p:
-                # check first 2 pages for visible text
                 for page in p.pages[:2]:
                     txt = (page.extract_text() or "").strip()
                     if txt:
                         text_found = True
                         break
+            is_image_only = not text_found
         except Exception as e:
-            current_app.logger.exception("pdfplumber check failed; continuing to conversion")
+            current_app.logger.exception("pdfplumber check failed; continuing anyway")
+            # if pdfplumber fails, we just try normal conversion
 
-        if not text_found:
-            # it's likely scanned or image only — pdf2docx doesn't do OCR
-            return jsonify({
-                "error": "PDF appears to be image/scanned (no selectable text).",
-                "suggestion": "Use an OCR step first (Tesseract) or convert PDF->JPG and run OCR."
-            }), 400
+        # If image-only → OCR to DOCX
+        if is_image_only:
+            from docx import Document  # python-docx
 
-        # -------------------------
-        # Convert PDF -> DOCX
-        # -------------------------
+            try:
+                ocr_text = ocr_pdf_to_text(pdf_to_use)
+            except Exception as e:
+                return jsonify({
+                    "error": "PDF appears to be scanned and OCR failed.",
+                    "details": str(e)
+                }), 500
+
+            doc = Document()
+            # Simple block paragraphs
+            for block in ocr_text.split("\n\n"):
+                block = block.strip()
+                if block:
+                    doc.add_paragraph(block)
+            doc.save(out_docx)
+
+            return send_file(out_docx, as_attachment=True, download_name="output.docx")
+
+        # Normal text PDF → use pdf2docx for layout
         try:
             cv = Converter(pdf_to_use)
-            # use convert with explicit start/end to avoid hidden failures
             cv.convert(out_docx, start=0, end=None)
             cv.close()
         except Exception as e:
-            # log stacktrace and return message to client
             current_app.logger.exception("pdf2docx conversion failed")
             return jsonify({"error": "Conversion failed", "details": str(e)}), 500
 
-        # -------------------------
-        # Send file (after_this_request will cleanup)
-        # -------------------------
         return send_file(out_docx, as_attachment=True, download_name="output.docx")
 
     finally:
-        # do not remove output files here — cleanup happens in after_this_request
+        # real cleanup is in after_this_request
         pass
 
+
 # --------------------------------------------------------
-# 2 - Word → PDF
+# 2 - Word → PDF (high quality, embedded fonts)
 # --------------------------------------------------------
 @app.post("/word-to-pdf")
 def word_to_pdf():
@@ -180,13 +226,11 @@ def word_to_pdf():
     out_dir = tempfile.mkdtemp()
 
     try:
-        # STEP 1 → Convert DOCX → ODT
+        # Step 1: DOC/DOCX → ODT
         subprocess.run(
-            [
-                "libreoffice", "--headless",
-                "--convert-to", "odt",
-                "--outdir", out_dir, doc
-            ],
+            ["libreoffice", "--headless",
+             "--convert-to", "odt",
+             "--outdir", out_dir, doc],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             check=True
@@ -195,7 +239,7 @@ def word_to_pdf():
         base = os.path.splitext(os.path.basename(doc))[0]
         odt_path = os.path.join(out_dir, f"{base}.odt")
 
-        # STEP 2 → Convert ODT → PDF (HIGH QUALITY)
+        # Step 2: ODT → high-quality PDF
         subprocess.run(
             [
                 "libreoffice", "--headless",
@@ -251,7 +295,7 @@ def ppt_to_pdf():
 
 
 # --------------------------------------------------------
-# 4 - JPG → PDF
+# 4 - JPG → PDF (300 DPI, max quality)
 # --------------------------------------------------------
 @app.post("/jpg-to-pdf")
 def jpg_to_pdf():
@@ -261,6 +305,7 @@ def jpg_to_pdf():
 
     images = []
     saved = []
+    out_pdf = None
 
     try:
         for f in files:
@@ -268,7 +313,7 @@ def jpg_to_pdf():
             saved.append(p)
 
             img = Image.open(p).convert("RGB")
-            # Increase DPI & preserve clarity
+            # High quality DPI
             img.info["dpi"] = (300, 300)
             images.append(img)
 
@@ -278,8 +323,8 @@ def jpg_to_pdf():
             out_pdf,
             save_all=True,
             append_images=images[1:],
-            quality=100,         # max quality
-            dpi=(300, 300)       # print quality
+            quality=100,
+            dpi=(300, 300)
         )
 
         return send_file(out_pdf, as_attachment=True, download_name="output.pdf")
@@ -287,11 +332,12 @@ def jpg_to_pdf():
     finally:
         for p in saved:
             cleanup(p)
-
+        if out_pdf:
+            cleanup(out_pdf)
 
 
 # --------------------------------------------------------
-# 5 - PDF → JPG
+# 5 - PDF → JPG  (high quality, vertical merge)
 # --------------------------------------------------------
 @app.post("/pdf-to-jpg")
 def pdf_to_jpg():
@@ -300,14 +346,15 @@ def pdf_to_jpg():
         return abort(400, "No file uploaded")
 
     pdf = save_upload(f, ".pdf")
+    out_jpg = None
 
     try:
-        pages = convert_from_path(pdf, dpi=200, poppler_path=POPPLER_PATH)
+        # Slightly higher DPI for better clarity
+        pages = convert_from_path(pdf, dpi=250, poppler_path=POPPLER_PATH)
 
         if not pages:
             return abort(400, "Failed to read PDF")
 
-        # Merge all pages vertically
         imgs = [p.convert("RGB") for p in pages]
         total_height = sum(img.height for img in imgs)
         max_width = max(img.width for img in imgs)
@@ -321,12 +368,17 @@ def pdf_to_jpg():
         out_jpg = tmp_file(".jpg")
         merged.save(out_jpg, "JPEG", quality=90)
 
-        return send_file(out_jpg, as_attachment=True,
-                         download_name="output.jpg", mimetype="image/jpeg")
+        return send_file(
+            out_jpg,
+            as_attachment=True,
+            download_name="output.jpg",
+            mimetype="image/jpeg"
+        )
 
     finally:
         cleanup(pdf)
-        cleanup(out_jpg)
+        if out_jpg:
+            cleanup(out_jpg)
 
 
 # --------------------------------------------------------
@@ -340,6 +392,7 @@ def merge_pdf():
 
     merger = PdfMerger()
     saved = []
+    out_pdf = None
 
     try:
         for f in files:
@@ -359,7 +412,8 @@ def merge_pdf():
     finally:
         for p in saved:
             cleanup(p)
-        cleanup(out_pdf)
+        if out_pdf:
+            cleanup(out_pdf)
 
 
 # --------------------------------------------------------
@@ -377,6 +431,7 @@ def split_pdf():
 
     pdf = save_upload(f, ".pdf")
     out_dir = tempfile.mkdtemp()
+    zip_path = None
 
     try:
         reader = PdfReader(pdf)
@@ -384,13 +439,19 @@ def split_pdf():
 
         pages = []
         for part in ranges.split(","):
+            part = part.strip()
+            if not part:
+                continue
             if "-" in part:
                 a, b = map(int, part.split("-"))
                 pages.extend(range(a, b + 1))
             else:
                 pages.append(int(part))
 
-        pages = [p for p in pages if 1 <= p <= total]
+        # Only valid page numbers
+        pages = sorted({p for p in pages if 1 <= p <= total})
+        if not pages:
+            return abort(400, "No valid page numbers in range")
 
         zip_path = tmp_file(".zip")
 
@@ -399,17 +460,19 @@ def split_pdf():
                 writer = PdfWriter()
                 writer.add_page(reader.pages[p - 1])
 
-                out_pdf = os.path.join(out_dir, f"page_{p}.pdf")
-                with open(out_pdf, "wb") as o:
+                single_pdf = os.path.join(out_dir, f"page_{p}.pdf")
+                with open(single_pdf, "wb") as o:
                     writer.write(o)
 
-                z.write(out_pdf, arcname=f"page_{p}.pdf")
+                z.write(single_pdf, arcname=f"page_{p}.pdf")
 
         return send_file(zip_path, as_attachment=True, download_name="split.zip")
 
     finally:
         cleanup(pdf)
         cleanup(out_dir)
+        if zip_path:
+            cleanup(zip_path)
 
 
 # --------------------------------------------------------
@@ -418,7 +481,7 @@ def split_pdf():
 @app.post("/rotate-pdf")
 def rotate_pdf():
     f = request.files.get("file")
-    angle = int(request.form.get("angle", 90))
+    angle = int(request.form.get("angle", 90) or 90)
 
     if not f:
         return abort(400, "No file")
@@ -431,7 +494,11 @@ def rotate_pdf():
         writer = PdfWriter()
 
         for page in reader.pages:
-            page.rotate(angle)
+            # PyPDF2 new versions: rotate() is deprecated, use rotate_clockwise
+            try:
+                page.rotate(angle)
+            except Exception:
+                page.rotate_clockwise(angle)
             writer.add_page(page)
 
         with open(out_pdf, "wb") as o:
@@ -475,8 +542,12 @@ def compress_pdf():
 
         subprocess.run(cmd, check=True)
 
-        return send_file(output_pdf, as_attachment=True,
-                         download_name="compressed.pdf", mimetype="application/pdf")
+        return send_file(
+            output_pdf,
+            as_attachment=True,
+            download_name="compressed.pdf",
+            mimetype="application/pdf"
+        )
 
     except subprocess.CalledProcessError:
         return abort(500, "Compression failed")
@@ -556,7 +627,7 @@ def unlock_pdf():
 
 
 # --------------------------------------------------------
-# 12 - Extract Text
+# 12 - Extract Text (with OCR fallback)
 # --------------------------------------------------------
 @app.post("/extract-text")
 def extract_text():
@@ -567,12 +638,33 @@ def extract_text():
     pdf = save_upload(f, ".pdf")
 
     try:
-        text = []
-        with pdfplumber.open(pdf) as p:
-            for page in p.pages:
-                text.append(page.extract_text() or "")
+        text_pages = []
+        has_text = False
 
-        return jsonify({"text": "\n\n--- PAGE BREAK ---\n\n".join(text)})
+        # First try pdfplumber (for normal text PDFs)
+        try:
+            with pdfplumber.open(pdf) as p:
+                for i, page in enumerate(p.pages, start=1):
+                    txt = (page.extract_text() or "").strip()
+                    if txt:
+                        has_text = True
+                    text_pages.append(f"--- PAGE {i} ---\n{txt}")
+        except Exception as e:
+            current_app.logger.exception("pdfplumber extract failed: %s", e)
+
+        # If no real text detected → OCR fallback
+        if not has_text:
+            try:
+                ocr_text = ocr_pdf_to_text(pdf)
+            except Exception as e:
+                return jsonify({
+                    "error": "This PDF seems scanned and OCR failed.",
+                    "details": str(e)
+                }), 500
+            return jsonify({"text": ocr_text})
+
+        # Normal text result
+        return jsonify({"text": "\n\n".join(text_pages).strip()})
 
     finally:
         cleanup(pdf)
