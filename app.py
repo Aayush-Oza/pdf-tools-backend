@@ -18,6 +18,9 @@ import zipfile
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
+# UNO PATH FIX for LibreOffice (IMPORTANT)
+os.environ["UNO_PATH"] = "/usr/lib/libreoffice/program"
+os.environ["PATH"] += ":/usr/lib/libreoffice/program"
 # Poppler + PATH fix for Render
 os.environ["PATH"] += ":/usr/bin:/usr/local/bin"
 POPPLER_PATH = "/usr/bin"
@@ -686,21 +689,24 @@ def home():
 @app.after_request
 def apply_cors(response):
     response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+    response.headers["Access-Control-Allow-Headers"] = "*"
     response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    response.headers["Access-Control-Max-Age"] = "86400"
     return response
 
 @app.before_request
-def handle_options():
+def handle_preflight():
     if request.method == "OPTIONS":
         resp = app.make_response("")
         resp.headers["Access-Control-Allow-Origin"] = "*"
-        resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+        resp.headers["Access-Control-Allow-Headers"] = "*"
         resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-        return resp  # <-- stop request here
+        return resp
 
-if __name__ == "__main__":
-    app.run(debug=True)
 
+
+# --------------------------------------------------------
+# START SERVER
+# --------------------------------------------------------
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(host="0.0.0.0", port=5000)
