@@ -1,16 +1,15 @@
-FROM python:3.11-slim
+FROM debian:bookworm
 
-# Avoid tzdata interactive prompt
 ENV DEBIAN_FRONTEND=noninteractive
 
 # -------------------------------------------------------
-# Install LibreOffice + Poppler + Ghostscript + Tesseract
+# System Dependencies
 # -------------------------------------------------------
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 \
+    python3-pip \
+    python3-distutils \
     libreoffice \
-    uno-libs-private \
-    ure \
-    default-jre \
     poppler-utils \
     ghostscript \
     tesseract-ocr \
@@ -29,28 +28,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# -------------------------------------------------------
-# Set working directory
-# -------------------------------------------------------
 WORKDIR /app
 
-# -------------------------------------------------------
-# Copy requirements and install Python deps
-# -------------------------------------------------------
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip3 install --no-cache-dir -r requirements.txt
 
-# -------------------------------------------------------
-# Copy backend source code
-# -------------------------------------------------------
 COPY . .
 
-# -------------------------------------------------------
-# Expose port used by Flask
-# -------------------------------------------------------
 EXPOSE 5000
 
-# -------------------------------------------------------
-# Start Flask app
-# -------------------------------------------------------
-CMD ["python", "app.py"]
+CMD ["python3", "app.py"]
