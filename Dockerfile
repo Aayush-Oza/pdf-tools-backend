@@ -4,8 +4,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 WORKDIR /app
 
 # ------------------------------------------------------
-# Install system dependencies for LibreOffice, Poppler,
-# Ghostscript, Tesseract OCR, and fonts.
+# Install system dependencies
 # ------------------------------------------------------
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
@@ -13,15 +12,18 @@ RUN apt-get update && \
         uno-libs-private \
         ure \
         default-jre \
-        libglu1-mesa \
-        libxinerama1 \
-        libxrandr2 \
-        libxcursor1 \
-        libxrender1 \
-        libfontconfig1 \
         poppler-utils \
         ghostscript \
         tesseract-ocr \
+        libtiff5 \
+        libjpeg62-turbo \
+        libpng16-16 \
+        libxrender1 \
+        libxext6 \
+        libsm6 \
+        libxinerama1 \
+        libxrandr2 \
+        libfontconfig1 \
         fonts-dejavu-core \
         fonts-liberation \
         fonts-noto \
@@ -35,12 +37,12 @@ RUN apt-get update && \
 COPY . .
 
 # ------------------------------------------------------
-# Install Python packages
+# Install Python dependencies
 # ------------------------------------------------------
 RUN pip install --no-cache-dir -r requirements.txt
 
 # ------------------------------------------------------
-# Expose API port + run server
+# Expose + Start Gunicorn
 # ------------------------------------------------------
 EXPOSE 5000
 CMD ["gunicorn", "app:app", "-b", "0.0.0.0:5000", "--workers", "2", "--timeout", "200"]
