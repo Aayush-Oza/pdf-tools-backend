@@ -12,6 +12,7 @@ RUN apt-get update && \
         libreoffice \
         uno-libs-private \
         ure \
+        default-jre \
         libglu1-mesa \
         libxinerama1 \
         libxrandr2 \

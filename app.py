@@ -196,7 +196,8 @@ def pdf_to_word():
         # Normal text PDF → use pdf2docx for layout
         try:
             cv = Converter(pdf_to_use)
-            cv.convert(out_docx, start=0, end=None)
+            cv.convert(out_docx, start=0, end=None, layout_mode=True)
+
             cv.close()
         except Exception as e:
             current_app.logger.exception("pdf2docx conversion failed")
@@ -277,11 +278,17 @@ def ppt_to_pdf():
     out_dir = tempfile.mkdtemp()
 
     try:
+        # High-quality export profile (better than default)
         subprocess.run(
-            ["libreoffice", "--headless", "--convert-to", "pdf",
-             "--outdir", out_dir, ppt],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            [
+                "libreoffice", "--headless",
+                "--convert-to",
+                "pdf:impress_pdf_Export:SelectPdfVersion=1;Quality=100;ImageCompression=0;LosslessImageCompression=true;UseTaggedPDF=true",
+                "--outdir", out_dir,
+                ppt,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             check=True
         )
 
@@ -289,6 +296,7 @@ def ppt_to_pdf():
         out_pdf = os.path.join(out_dir, f"{base}.pdf")
 
         return send_file(out_pdf, as_attachment=True, download_name="output.pdf")
+
     finally:
         cleanup(ppt)
         cleanup(out_dir)
@@ -313,7 +321,7 @@ def jpg_to_pdf():
             saved.append(p)
 
             img = Image.open(p).convert("RGB")
-            # High quality DPI
+            img = img.resize((img.width, img.height), resample=Image.LANCZOS)  # high quality resample
             img.info["dpi"] = (300, 300)
             images.append(img)
 
@@ -350,7 +358,7 @@ def pdf_to_jpg():
 
     try:
         # Slightly higher DPI for better clarity
-        pages = convert_from_path(pdf, dpi=250, poppler_path=POPPLER_PATH)
+        pages = convert_from_path(pdf, dpi=350, poppler_path=POPPLER_PATH)
 
         if not pages:
             return abort(400, "Failed to read PDF")
@@ -641,30 +649,44 @@ def extract_text():
         text_pages = []
         has_text = False
 
-        # First try pdfplumber (for normal text PDFs)
+        # ---------- Improve Normal Text Extraction ----------
         try:
             with pdfplumber.open(pdf) as p:
                 for i, page in enumerate(p.pages, start=1):
-                    txt = (page.extract_text() or "").strip()
-                    if txt:
+                    raw = page.extract_text() or ""
+                    cleaned = " ".join(
+                        line.strip()
+                        for line in raw.split("\n")
+                        if line.strip()
+                    )
+                    if cleaned:
                         has_text = True
-                    text_pages.append(f"--- PAGE {i} ---\n{txt}")
-        except Exception as e:
-            current_app.logger.exception("pdfplumber extract failed: %s", e)
+                    text_pages.append(f"--- PAGE {i} ---\n{cleaned}\n")
+        except:
+            pass
 
-        # If no real text detected → OCR fallback
+        # ---------- OCR Fallback (formatted paragraphs) ----------
         if not has_text:
-            try:
-                ocr_text = ocr_pdf_to_text(pdf)
-            except Exception as e:
-                return jsonify({
-                    "error": "This PDF seems scanned and OCR failed.",
-                    "details": str(e)
-                }), 500
-            return jsonify({"text": ocr_text})
+            ocr_raw = ocr_pdf_to_text(pdf)
+            
+            # Remove page markers like "--- PAGE X ---"
+            ocr_raw = "\n".join(
+                line for line in ocr_raw.split("\n")
+                if not line.strip().startswith("--- PAGE")
+            )           
+            paragraphs = [
+                para.strip()
+                for para in ocr_raw.split("\n")
+                if para.strip()
+            ]
 
-        # Normal text result
-        return jsonify({"text": "\n\n".join(text_pages).strip()})
+            formatted = "\n\n".join(paragraphs)
+
+            return jsonify({"text": formatted})
+
+        # normal text result
+        formatted = "\n\n".join(text_pages).strip()
+        return jsonify({"text": formatted})
 
     finally:
         cleanup(pdf)
