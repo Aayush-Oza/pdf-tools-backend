@@ -1,3 +1,7 @@
+Flask
+flask-cors
+gunicorn
+
 pytesseract
 python-docx
 pdf2image
@@ -6,6 +10,3 @@ pikepdf
 pdfplumber
 Pillow
 PyPDF2
-Flask
-flask-cors
-gunicorn
