@@ -5,43 +5,66 @@ import shutil
 import subprocess
 from werkzeug.utils import secure_filename
 from flask_cors import CORS
-# SPEED BOOST: Preload LibreOffice in background for faster conversions
-subprocess.Popen(
-    ["libreoffice", "--headless"],
-    stdout=subprocess.DEVNULL,
-    stderr=subprocess.DEVNULL
-)
-
-from pdf2docx import Converter
-from PIL import Image
-from pdf2image import convert_from_path
-import pytesseract
-import pikepdf
-from PyPDF2 import PdfReader, PdfWriter, PdfMerger
-import pdfplumber
 import zipfile
 import logging
+
+# Lighten logs
 logging.getLogger('werkzeug').setLevel(logging.ERROR)
 
+# --------------------------------------------------------
+# APP + BASIC CONFIG
+# --------------------------------------------------------
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-# UNO PATH FIX for LibreOffice (IMPORTANT)
-os.environ["UNO_PATH"] = "/usr/lib/libreoffice/program"
-os.environ["PATH"] += ":/usr/lib/libreoffice/program"
-# Poppler + PATH fix for Render
-os.environ["PATH"] += ":/usr/bin:/usr/local/bin"
+# LibreOffice / Poppler environment
+os.environ.setdefault("UNO_PATH", "/usr/lib/libreoffice/program")
+os.environ["PATH"] += ":/usr/lib/libreoffice/program:/usr/bin:/usr/local/bin"
+
 POPPLER_PATH = "/usr/bin"
 
-# 200 MB max
+# 200 MB max upload (you can reduce this if needed to save memory)
 app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024
 
+# --------------------------------------------------------
+# LAZY IMPORT HELPERS (to avoid loading heavy libs until needed)
+# --------------------------------------------------------
+def get_pdf2docx_converter():
+    from pdf2docx import Converter
+    return Converter
+
+def get_pil_image():
+    from PIL import Image
+    return Image
+
+def get_convert_from_path():
+    from pdf2image import convert_from_path
+    return convert_from_path
+
+def get_pytesseract():
+    import pytesseract
+    return pytesseract
+
+def get_pikepdf():
+    import pikepdf
+    return pikepdf
+
+def get_pypdf():
+    from PyPDF2 import PdfReader, PdfWriter, PdfMerger
+    return PdfReader, PdfWriter, PdfMerger
+
+def get_pdfplumber():
+    import pdfplumber
+    return pdfplumber
+
+def get_docx_document():
+    from docx import Document
+    return Document
 
 # --------------------------------------------------------
-# Utility helpers
+# UTILS
 # --------------------------------------------------------
 def tmp_file(ext: str = "") -> str:
-    """Create a temp file path with given extension."""
     fd, path = tempfile.mkstemp(suffix=ext)
     os.close(fd)
     return path
@@ -58,7 +81,6 @@ def save_upload(file, ext: str | None = None) -> str:
         for chunk in iter(lambda: file.stream.read(4096), b""):
             f.write(chunk)
 
-
     return path
 
 
@@ -70,35 +92,53 @@ def cleanup(path: str):
         elif os.path.isfile(path):
             os.remove(path)
     except Exception:
-        # Do not crash app just because cleanup fails
         pass
 
 
-def ocr_pdf_to_text(pdf_path: str, dpi: int = 300) -> str:
+def ocr_pdf_to_text(pdf_path: str, dpi: int = 200) -> str:
     """
-    OCR an image-based PDF using Tesseract via pdf2image.
-    Returns plain text with simple page separators.
+    OCR an image-based PDF using Tesseract.
+    Memory-friendly: render pages to disk, not all in RAM.
     """
-    try:
-        pages = convert_from_path(pdf_path, dpi=dpi, poppler_path=POPPLER_PATH)
-    except Exception as e:
-        current_app.logger.exception("OCR pdf2image failed")
-        raise RuntimeError(f"OCR rasterization failed: {e}")
+    convert_from_path = get_convert_from_path()
+    pytesseract = get_pytesseract()
+    Image = get_pil_image()
 
-    texts = []
-    for i, page in enumerate(pages, start=1):
+    temp_dir = tempfile.mkdtemp()
+    try:
         try:
-            text = pytesseract.image_to_string(
-                page,
-                config="--oem 1 --psm 3 -l eng"
+            # paths_only=True → get file paths, not PIL objects
+            image_paths = convert_from_path(
+                pdf_path,
+                dpi=dpi,
+                poppler_path=POPPLER_PATH,
+                output_folder=temp_dir,
+                fmt="png",
+                paths_only=True,
+                thread_count=2,
             )
         except Exception as e:
-            current_app.logger.exception("Tesseract OCR failed on page %s", i)
-            text = ""
-        texts.append(f"--- PAGE {i} ---\n{text.strip()}")
+            current_app.logger.exception("OCR pdf2image failed")
+            raise RuntimeError(f"OCR rasterization failed: {e}")
 
-    return "\n\n".join(texts).strip()
+        texts = []
+        # Process each page one-by-one to keep memory lower
+        for i, img_path in enumerate(sorted(image_paths), start=1):
+            try:
+                with Image.open(img_path) as img:
+                    text = pytesseract.image_to_string(
+                        img,
+                        config="--oem 1 --psm 3 -l eng"
+                    )
+            except Exception:
+                current_app.logger.exception("Tesseract OCR failed on page %s", i)
+                text = ""
+            texts.append(f"--- PAGE {i} ---\n{text.strip()}")
 
+        return "\n\n".join(texts).strip()
+
+    finally:
+        cleanup(temp_dir)
 
 # --------------------------------------------------------
 # 1 - PDF → Word  (with OCR fallback)
@@ -108,6 +148,10 @@ def pdf_to_word():
     f = request.files.get("file")
     if not f:
         return abort(400, "No file uploaded")
+
+    PdfReader, PdfWriter, _ = get_pypdf()
+    Converter = get_pdf2docx_converter()
+    Document = get_docx_document()
 
     pdf = save_upload(f, ".pdf")
     unlocked_pdf = tmp_file(".pdf")
@@ -121,9 +165,7 @@ def pdf_to_word():
         return response
 
     try:
-        # ---------------------------------------------------
-        # TRY OPENING PDF (check encryption)
-        # ---------------------------------------------------
+        # Try opening PDF
         try:
             reader = PdfReader(pdf, strict=False)
         except Exception as e:
@@ -134,9 +176,7 @@ def pdf_to_word():
 
         pdf_to_use = pdf
 
-        # ---------------------------------------------------
-        # HANDLE ENCRYPTED PDF
-        # ---------------------------------------------------
+        # Handle encrypted PDF
         if getattr(reader, "is_encrypted", False):
             try:
                 try:
@@ -148,37 +188,35 @@ def pdf_to_word():
                         writer.write(f2)
                     pdf_to_use = unlocked_pdf
                 except Exception:
+                    pikepdf = get_pikepdf()
                     try:
-                        import pikepdf
                         with pikepdf.open(pdf, password="") as pp:
                             pp.save(unlocked_pdf)
                         pdf_to_use = unlocked_pdf
                     except pikepdf._qpdf.PasswordError:
-                        return jsonify({"error": "PDF is password protected. Use Unlock tool first."}), 400
+                        return jsonify({
+                            "error": "PDF is password protected. Use Unlock tool first."
+                        }), 400
             except Exception as e:
-                return jsonify({"error": "Failed processing encrypted PDF", "details": str(e)}), 400
+                return jsonify({
+                    "error": "Failed processing encrypted PDF",
+                    "details": str(e)
+                }), 400
 
-        # ---------------------------------------------------
-        # FIRST TRY NORMAL PDF → WORD (pdf2docx)
-        # ---------------------------------------------------
-        from docx import Document
-
+        # Try normal PDF → Word via pdf2docx
         try:
             cv = Converter(pdf_to_use)
             cv.convert(out_docx, start=0, end=None, layout_mode=True)
             cv.close()
 
-            # Check if conversion produced text (not empty)
             doc_check = Document(out_docx)
             if len(doc_check.paragraphs) > 0:
                 return send_file(out_docx, as_attachment=True, download_name="output.docx")
-
         except Exception:
-            pass  # pdf2docx failed → fallback to OCR
+            # fallback to OCR later
+            pass
 
-        # ---------------------------------------------------
-        # FALLBACK TO OCR IF pdf2docx FAILED
-        # ---------------------------------------------------
+        # Fallback to OCR if pdf2docx failed
         try:
             ocr_text = ocr_pdf_to_text(pdf_to_use)
         except Exception as e:
@@ -199,9 +237,8 @@ def pdf_to_word():
     finally:
         pass
 
-
 # --------------------------------------------------------
-# 2 - Word → PDF (high quality, embedded fonts)
+# 2 - Word → PDF (LibreOffice on-demand)
 # --------------------------------------------------------
 @app.post("/word-to-pdf")
 def word_to_pdf():
@@ -219,9 +256,11 @@ def word_to_pdf():
     try:
         # Step 1: DOC/DOCX → ODT
         subprocess.run(
-            ["libreoffice", "--headless",
-             "--convert-to", "odt",
-             "--outdir", out_dir, doc],
+            [
+                "libreoffice", "--headless",
+                "--convert-to", "odt",
+                "--outdir", out_dir, doc
+            ],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             check=True
@@ -250,9 +289,8 @@ def word_to_pdf():
         cleanup(doc)
         cleanup(out_dir)
 
-
 # --------------------------------------------------------
-# PERFECT PPT → PDF  (NO formatting change, Not compressed)
+# 3 - PPT → PDF
 # --------------------------------------------------------
 @app.post("/ppt-to-pdf")
 def ppt_to_pdf():
@@ -268,50 +306,40 @@ def ppt_to_pdf():
     out_dir = tempfile.mkdtemp()
 
     try:
-        # ----------------------------------------------------
-        # Direct PPT → PDF export using LibreOffice
-        # This preserves:
-        # - Exact fonts
-        # - Exact spacing & alignment
-        # - Shapes, gradients, backgrounds
-        # - Slide layout 100% accurate
-        # ----------------------------------------------------
         subprocess.run(
             [
                 "libreoffice", "--headless",
-                "--convert-to",
-                "pdf:impress_pdf_Export",
+                "--convert-to", "pdf:impress_pdf_Export",
                 "--outdir", out_dir,
                 ppt_path
             ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
             check=True
         )
 
-        # Construct PDF path
         base = os.path.splitext(os.path.basename(ppt_path))[0]
         pdf_path = os.path.join(out_dir, f"{base}.pdf")
 
         if not os.path.exists(pdf_path):
             return abort(500, "Failed to export PDF from PPT.")
 
-        # Send perfect output
         return send_file(pdf_path, as_attachment=True, download_name="output.pdf")
 
     finally:
         cleanup(ppt_path)
         cleanup(out_dir)
 
-
 # --------------------------------------------------------
-# 4 - JPG → PDF (300 DPI, max quality)
+# 4 - JPG → PDF
 # --------------------------------------------------------
 @app.post("/jpg-to-pdf")
 def jpg_to_pdf():
     files = request.files.getlist("files")
     if not files:
         return abort(400, "No files selected")
+
+    Image = get_pil_image()
 
     images = []
     saved = []
@@ -323,7 +351,6 @@ def jpg_to_pdf():
             saved.append(p)
 
             img = Image.open(p).convert("RGB")
-            img = img.resize((img.width, img.height), resample=Image.LANCZOS)  # high quality resample
             img.info["dpi"] = (300, 300)
             images.append(img)
 
@@ -345,9 +372,8 @@ def jpg_to_pdf():
         if out_pdf:
             cleanup(out_pdf)
 
-
 # --------------------------------------------------------
-# 5 - PDF → JPG  (high quality, vertical merge)
+# 5 - PDF → JPG (memory-friendly)
 # --------------------------------------------------------
 @app.post("/pdf-to-jpg")
 def pdf_to_jpg():
@@ -355,27 +381,28 @@ def pdf_to_jpg():
     if not f:
         return abort(400, "No file uploaded")
 
+    convert_from_path = get_convert_from_path()
+
     pdf = save_upload(f, ".pdf")
     out_dir = tempfile.mkdtemp()
     zip_path = tmp_file(".zip")
 
     try:
-        # Faster + enough quality
-        pages = convert_from_path(pdf, dpi=200, poppler_path=POPPLER_PATH, thread_count=4)
+        # paths_only=True to avoid keeping all PIL images in RAM
+        image_paths = convert_from_path(
+            pdf,
+            dpi=180,
+            poppler_path=POPPLER_PATH,
+            output_folder=out_dir,
+            fmt="jpeg",
+            paths_only=True,
+            thread_count=2,
+        )
 
-        jpg_files = []
-
-        for i, page in enumerate(pages, start=1):
-            img = page.convert("RGB")
-
-            out_jpg = os.path.join(out_dir, f"page_{i}.jpg")
-            img.save(out_jpg, "JPEG", quality=90, optimize=True)
-            jpg_files.append(out_jpg)
-
-        # Zip all JPGs
         with zipfile.ZipFile(zip_path, "w") as z:
-            for p in jpg_files:
-                z.write(p, arcname=os.path.basename(p))
+            for img_path in sorted(image_paths):
+                arcname = os.path.basename(img_path)
+                z.write(img_path, arcname=arcname)
 
         return send_file(zip_path, as_attachment=True, download_name="images.zip")
 
@@ -383,7 +410,6 @@ def pdf_to_jpg():
         cleanup(pdf)
         cleanup(out_dir)
         cleanup(zip_path)
-
 
 # --------------------------------------------------------
 # 6 - Merge PDF
@@ -393,6 +419,8 @@ def merge_pdf():
     files = request.files.getlist("files")
     if not files:
         return abort(400, "No files")
+
+    PdfReader, PdfWriter, PdfMerger = get_pypdf()
 
     merger = PdfMerger()
     saved = []
@@ -419,7 +447,6 @@ def merge_pdf():
         if out_pdf:
             cleanup(out_pdf)
 
-
 # --------------------------------------------------------
 # 7 - Split PDF
 # --------------------------------------------------------
@@ -428,6 +455,8 @@ def split_pdf():
     f = request.files.get("file")
     if not f:
         return abort(400, "No file")
+
+    PdfReader, PdfWriter, _ = get_pypdf()
 
     ranges = request.form.get("ranges")
     if not ranges:
@@ -452,7 +481,6 @@ def split_pdf():
             else:
                 pages.append(int(part))
 
-        # Only valid page numbers
         pages = sorted({p for p in pages if 1 <= p <= total})
         if not pages:
             return abort(400, "No valid page numbers in range")
@@ -478,12 +506,13 @@ def split_pdf():
         if zip_path:
             cleanup(zip_path)
 
-
 # --------------------------------------------------------
 # 8 - Rotate PDF
 # --------------------------------------------------------
 @app.post("/rotate-pdf")
 def rotate_pdf():
+    PdfReader, PdfWriter, _ = get_pypdf()
+
     f = request.files.get("file")
     angle = int(request.form.get("angle", 90) or 90)
 
@@ -498,7 +527,6 @@ def rotate_pdf():
         writer = PdfWriter()
 
         for page in reader.pages:
-            # PyPDF2 new versions: rotate() is deprecated, use rotate_clockwise
             try:
                 page.rotate(angle)
             except Exception:
@@ -513,7 +541,6 @@ def rotate_pdf():
     finally:
         cleanup(pdf)
         cleanup(out_pdf)
-
 
 # --------------------------------------------------------
 # 9 - Compress PDF (Ghostscript)
@@ -560,12 +587,13 @@ def compress_pdf():
         cleanup(input_pdf)
         cleanup(output_pdf)
 
-
 # --------------------------------------------------------
 # 10 - Protect PDF
 # --------------------------------------------------------
 @app.post("/protect-pdf")
 def protect_pdf():
+    PdfReader, PdfWriter, _ = get_pypdf()
+
     f = request.files.get("file")
     pwd = request.form.get("password")
 
@@ -593,12 +621,13 @@ def protect_pdf():
         cleanup(pdf)
         cleanup(out_pdf)
 
-
 # --------------------------------------------------------
 # 11 - Unlock PDF
 # --------------------------------------------------------
 @app.post("/unlock-pdf")
 def unlock_pdf():
+    PdfReader, PdfWriter, _ = get_pypdf()
+
     f = request.files.get("file")
     pwd = request.form.get("password", "")
 
@@ -629,12 +658,13 @@ def unlock_pdf():
         cleanup(pdf)
         cleanup(out_pdf)
 
-
 # --------------------------------------------------------
 # 12 - Extract Text (with OCR fallback)
 # --------------------------------------------------------
 @app.post("/extract-text")
 def extract_text():
+    pdfplumber = get_pdfplumber()
+
     f = request.files.get("file")
     if not f:
         return abort(400, "No file")
@@ -645,7 +675,7 @@ def extract_text():
         text_pages = []
         has_text = False
 
-        # ---------- Improve Normal Text Extraction ----------
+        # Normal text extraction
         try:
             with pdfplumber.open(pdf) as p:
                 for i, page in enumerate(p.pages, start=1):
@@ -658,41 +688,35 @@ def extract_text():
                     if cleaned:
                         has_text = True
                     text_pages.append(f"--- PAGE {i} ---\n{cleaned}\n")
-        except:
+        except Exception:
             pass
 
-        # ---------- OCR Fallback (formatted paragraphs) ----------
+        # OCR fallback
         if not has_text:
             ocr_raw = ocr_pdf_to_text(pdf)
-            
-            # Remove page markers like "--- PAGE X ---"
+
             ocr_raw = "\n".join(
                 line for line in ocr_raw.split("\n")
                 if not line.strip().startswith("--- PAGE")
-            )           
+            )
             paragraphs = [p.strip() for p in ocr_raw.split("\n\n") if p.strip()]
             formatted = "\n\n".join(paragraphs)
 
             return jsonify({"text": formatted})
 
-        # normal text result
         formatted = "\n\n".join(text_pages).strip()
         return jsonify({"text": formatted})
 
     finally:
         cleanup(pdf)
 
-
 # --------------------------------------------------------
-# Test
+# ROOT + CORS
 # --------------------------------------------------------
 @app.get("/")
 def home():
-    return "PDF Tools Backend Running"
+    return "PDF Tools Backend Running (Optimized for Render Free Tier)"
 
-# --------------------------------------------------------
-# GLOBAL CORS FIX FOR ALL ROUTES
-# --------------------------------------------------------
 @app.after_request
 def apply_cors(response):
     response.headers["Access-Control-Allow-Origin"] = "*"
@@ -710,10 +734,8 @@ def handle_preflight():
         resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
         return resp
 
-
-
 # --------------------------------------------------------
-# START SERVER
+# START SERVER (LOCAL ONLY)
 # --------------------------------------------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
