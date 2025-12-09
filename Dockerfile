@@ -13,6 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libreoffice-core \
     libreoffice-writer \
     libreoffice-impress \
+    libreoffice-calc \
     poppler-utils \
     ghostscript \
     tesseract-ocr \

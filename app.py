@@ -1,4 +1,5 @@
-# app.py
+# ---------------- Part 1/3 ----------------
+# app.py (PART 1/3) - config, lazy imports, utilities, text formatting, OCR
 from flask import Flask, request, send_file, abort, jsonify, after_this_request, current_app
 import os
 import tempfile
@@ -9,6 +10,7 @@ from flask_cors import CORS
 import zipfile
 import logging
 import re
+import time
 
 # -----------------------------
 # Basic config & limits
@@ -23,18 +25,29 @@ os.environ.setdefault("UNO_PATH", "/usr/lib/libreoffice/program")
 os.environ["PATH"] += ":/usr/lib/libreoffice/program:/usr/bin:/usr/local/bin"
 POPPLER_PATH = "/usr/bin"
 
-# upload limit (200 MB). Adjust down if you hit OOM.
-app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024
+# Overall upload config (safety)
+# We still do explicit per-tool checks; MAX_CONTENT_LENGTH is a final safety net.
+app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024  # 200MB absolute upper
+
+# Per-tool client-side and server-side limits (bytes)
+PER_TOOL_LIMIT_BYTES = {
+    # default tools
+    "default": 25 * 1024 * 1024,       # 25 MB for most
+    "compress-pdf": 50 * 1024 * 1024,  # 50 MB for compress
+}
 
 # operational limits to protect 512 MB runtime
-MAX_OCR_PAGES = 40        # OCR at most 40 pages by default
-OCR_DPI = 180             # DPI for rasterization (lower => less memory)
-PDF_TO_JPG_DPI = 160
+MAX_OCR_PAGES = 30        # OCR at most 30 pages (reduced for speed/memory)
+OCR_DPI = 150             # DPI for rasterization (lower => less memory)
+PDF_TO_JPG_DPI = 140
 IMAGE_THREAD_COUNT = 1    # single-threaded for pdf2image/poppler
-PDF2DOCX_PAGE_LIMIT = 200 # limit pages for pdf2docx conversion (safety)
+PDF2DOCX_PAGE_LIMIT = 200 # safety cap (if library supports limiting)
+
+# Timeouts for subprocess calls (seconds)
+SUBPROCESS_TIMEOUT = 120
 
 # -----------------------------
-# Lazy imports to reduce memory
+# Lazy imports to reduce memory + startup cost
 # -----------------------------
 def lazy_pdf2docx_converter():
     from pdf2docx import Converter
@@ -69,7 +82,7 @@ def lazy_docx_Document():
     return Document
 
 # -----------------------------
-# Utilities
+# Utilities (disk-based streaming saves)
 # -----------------------------
 def tmp_file(ext: str = "") -> str:
     fd, path = tempfile.mkstemp(suffix=ext)
@@ -80,12 +93,18 @@ def tmp_dir() -> str:
     return tempfile.mkdtemp()
 
 def save_upload(file_obj, ext: str | None = None) -> str:
+    """
+    Write uploaded file to disk in a streamed manner (small chunks).
+    Returns path to the saved file.
+    """
     filename = secure_filename(file_obj.filename or "upload")
     extension = ext if ext else os.path.splitext(filename)[1] or ""
     path = tmp_file(extension)
     file_obj.stream.seek(0)
     with open(path, "wb") as f:
-        for chunk in iter(lambda: file_obj.stream.read(4096), b""):
+        for chunk in iter(lambda: file_obj.stream.read(1024 * 64), b""):
+            if not chunk:
+                break
             f.write(chunk)
     return path
 
@@ -99,15 +118,67 @@ def cleanup(path: str):
             os.remove(path)
     except Exception:
         # never raise from cleanup
-        pass
+        current_app.logger.debug("cleanup failed for %s", path)
 
-def run_subprocess(cmd, **kwargs):
-    """Run subprocess and convert CalledProcessError into HTTP 500 with logs."""
+def run_subprocess(cmd, timeout=SUBPROCESS_TIMEOUT, **kwargs):
+    """
+    Run subprocess with timeout and convert CalledProcessError into HTTP 500 logs.
+    """
     try:
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, **kwargs)
-    except subprocess.CalledProcessError as e:
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT, check=True, timeout=timeout, **kwargs)
+    except subprocess.TimeoutExpired:
+        current_app.logger.exception("Subprocess timed out: %s", cmd)
+        raise
+    except subprocess.CalledProcessError:
         current_app.logger.exception("Subprocess failed: %s", cmd)
         raise
+
+# -----------------------------
+# Size validation helpers
+# -----------------------------
+def get_limit_for_tool(tool_name: str) -> int:
+    if tool_name == "compress-pdf":
+        return PER_TOOL_LIMIT_BYTES["compress-pdf"]
+    return PER_TOOL_LIMIT_BYTES["default"]
+
+def check_request_size_from_files(files_list, tool_name: str) -> tuple[bool, str]:
+    """
+    Sum sizes of uploaded FileStorage objects if they expose .content_length or .stream,
+    fallback to request.content_length if available.
+    Returns (True, "") if ok else (False, "error message")
+    """
+    # If Content-Length header exists and is very large, reject early
+    total_from_header = request.content_length or 0
+    limit = get_limit_for_tool(tool_name)
+
+    # If header present and exceeds limit -> reject
+    if total_from_header and total_from_header > limit:
+        return False, f"Total upload size ({round(total_from_header/1024/1024,2)} MB) exceeds allowed {round(limit/1024/1024,2)} MB."
+
+    # Otherwise compute by summing .content_length or .stream if available
+    total = 0
+    for f in files_list:
+        # Flask FileStorage has .content_length sometimes; else use .stream length (not ideal)
+        size = getattr(f, "content_length", None)
+        if not size:
+            try:
+                # try to read from stream without consuming it permanently
+                pos = f.stream.tell()
+                f.stream.seek(0, os.SEEK_END)
+                size = f.stream.tell()
+                f.stream.seek(pos)
+            except Exception:
+                size = None
+        if size:
+            total += int(size)
+        else:
+            # fallback: assume a conservative large size; can't accurately compute -> use header or allow but rely on MAX_CONTENT_LENGTH
+            total += 0
+
+        if total > limit:
+            return False, f"Total upload size exceeds allowed {round(limit/1024/1024,2)} MB."
+
+    return True, ""
 
 # -----------------------------
 # Smart Hybrid formatting helpers (Option C)
@@ -126,10 +197,6 @@ def is_bullet_line(s: str) -> bool:
     return False
 
 def detect_heading(lines):
-    """
-    Heuristic: a heading is a short line (<= 8 words) in all-caps or Title Case,
-    or a line followed by an empty line and then a paragraph.
-    """
     heading_lines = set()
     for i, line in enumerate(lines):
         t = line.strip()
@@ -137,24 +204,15 @@ def detect_heading(lines):
             continue
         words = t.split()
         if 1 <= len(words) <= 8:
-            # all caps
             if t.isupper() and any(c.isalpha() for c in t):
                 heading_lines.add(i)
                 continue
-            # Title Case heuristic (First letters capitalized and not too long)
-            if all(w[0].isupper() for w in words if w):
+            if all(w and w[0].isupper() for w in words if w):
                 heading_lines.add(i)
     return heading_lines
 
 def merge_lines_to_paragraphs(raw_text: str) -> str:
-    """
-    Convert OCR/raw text lines into smart hybrid paragraphs:
-    - Merge lines that are likely part of the same paragraph (not bullets, not headings).
-    - Detect bullets & numbered lists and keep them as list items.
-    - Detect headings using heuristics and add spacing.
-    """
     lines = [ln.rstrip() for ln in raw_text.splitlines()]
-    # remove repeated blank lines
     cleaned_lines = []
     for ln in lines:
         if cleaned_lines and cleaned_lines[-1] == "" and ln == "":
@@ -169,13 +227,10 @@ def merge_lines_to_paragraphs(raw_text: str) -> str:
     while i < len(lines):
         ln = lines[i].strip()
         if ln == "":
-            # blank line -> paragraph separator
             i += 1
             continue
 
-        # bullet/numbered list detection
         if is_bullet_line(ln):
-            # collect contiguous bullets
             bullets = []
             while i < len(lines) and lines[i].strip() and is_bullet_line(lines[i]):
                 bullets.append(lines[i].strip())
@@ -183,33 +238,25 @@ def merge_lines_to_paragraphs(raw_text: str) -> str:
             out_blocks.append("\n".join(bullets))
             continue
 
-        # heading detection
         if i in headings_idx:
             out_blocks.append(ln.upper() if ln.isupper() else ln)
             i += 1
             continue
 
-        # Otherwise gather lines that should be merged into a paragraph
         para_lines = [ln]
         i += 1
         while i < len(lines) and lines[i].strip() and not is_bullet_line(lines[i]) and (i not in headings_idx):
             next_ln = lines[i].strip()
-            # Heuristic: if previous line ends with punctuation, keep newline.
             if para_lines[-1].endswith(('.', '?', '!', ':', ';', '—', '-')):
-                # treat as end-of-sentence; still merge but with space
                 para_lines.append(next_ln)
             else:
-                # merge broken line if short and next starts lowercase or continuation
                 para_lines.append(next_ln)
             i += 1
-        # join with space, but preserve single newlines in certain cases
         paragraph = " ".join(x for x in [p.strip() for p in para_lines] if x)
         out_blocks.append(paragraph)
 
-    # Post processing: fix multiple spaces
     out = "\n\n".join(block.strip() for block in out_blocks if block.strip())
     out = re.sub(r' {2,}', ' ', out)
-    # Normalize bullet markers to a consistent bullet (•)
     out = re.sub(r'^\s*[-\u2022]\s+', '• ', out, flags=re.MULTILINE)
     return out.strip()
 
@@ -217,17 +264,12 @@ def merge_lines_to_paragraphs(raw_text: str) -> str:
 # OCR pipeline (disk-based, memory-friendly)
 # -----------------------------
 def ocr_pdf_to_text(pdf_path: str, max_pages: int = MAX_OCR_PAGES, dpi: int = OCR_DPI) -> str:
-    """
-    Rasterize PDF pages to images on disk, OCR each page sequentially,
-    and return combined text. Uses Smart Hybrid formatting on the combined OCR.
-    """
     convert_from_path = lazy_pdf2image_convert()
     pytesseract = lazy_pytesseract()
     Image = lazy_pil_Image()
 
     tmpdir = tmp_dir()
     try:
-        # rasterize to disk; paths_only ensures we get file paths
         try:
             image_paths = convert_from_path(
                 pdf_path,
@@ -239,21 +281,18 @@ def ocr_pdf_to_text(pdf_path: str, max_pages: int = MAX_OCR_PAGES, dpi: int = OC
                 thread_count=IMAGE_THREAD_COUNT,
             )
         except Exception as e:
-            current_app.logger.exception("pdf2image rasterization failed")
+            current_app.logger.exception("pdf2image rasterization failed: %s", e)
             raise RuntimeError(f"Rasterization failed: {e}")
 
         if not image_paths:
             return ""
 
-        # limit pages
         image_paths = sorted(image_paths)[:max_pages]
 
         page_texts = []
         for idx, img_path in enumerate(image_paths, start=1):
             try:
-                # open image from disk, OCR, then close immediately
                 with Image.open(img_path) as im:
-                    # optionally convert to grayscale for faster OCR
                     im = im.convert("L")
                     txt = pytesseract.image_to_string(im, config="--oem 1 --psm 3 -l eng")
             except Exception:
@@ -262,20 +301,29 @@ def ocr_pdf_to_text(pdf_path: str, max_pages: int = MAX_OCR_PAGES, dpi: int = OC
             page_texts.append(f"--- PAGE {idx} ---\n{txt.strip()}")
 
         combined = "\n\n".join(page_texts).strip()
-        # Smart Hybrid formatting: remove page markers and reformat
         stripped = "\n".join(line for line in combined.splitlines() if not line.strip().startswith('--- PAGE'))
         formatted = merge_lines_to_paragraphs(stripped)
         return formatted
 
     finally:
         cleanup(tmpdir)
+# ---------------- End of Part 1/3 ----------------
+# ---------------- Part 2/3 ----------------
+# app.py (PART 2/3) - main conversion endpoints (pdf->word, word->pdf, ppt->pdf, jpg->pdf, pdf->jpg)
+# NOTE: This is the middle chunk; keep order as provided when concatenating.
 
 # -----------------------------
 # Endpoint: PDF → Word (pdf2docx with OCR fallback)
 # -----------------------------
 @app.post("/pdf-to-word")
 def pdf_to_word():
-    f = request.files.get("file")
+    tool = "pdf-to-word"
+    files = [request.files.get("file")] if request.files.get("file") else []
+    ok, err = check_request_size_from_files(files, tool)
+    if not ok:
+        return abort(413, err)
+
+    f = files[0] if files else None
     if not f:
         return abort(400, "No file uploaded")
 
@@ -295,16 +343,14 @@ def pdf_to_word():
         return resp
 
     try:
-        # Try opening PDF and check if encrypted
         try:
             reader = PdfReader(pdf_path, strict=False)
         except Exception as e:
+            current_app.logger.exception("Pdf open failed")
             return jsonify({"error": "Unable to open PDF.", "details": str(e)}), 400
 
         pdf_to_use = pdf_path
-
         if getattr(reader, "is_encrypted", False):
-            # Try empty-password unlock then pikepdf fallback
             try:
                 reader.decrypt("")
                 writer = PdfWriter()
@@ -322,42 +368,37 @@ def pdf_to_word():
                 except Exception:
                     return jsonify({"error": "PDF encrypted. Use Unlock tool first."}), 400
 
-        # Attempt pdf2docx conversion first (best fidelity)
+        # Try pdf2docx conversion (may be heavy)
         try:
-            # Use Converter but limit pages for safety
             cv = Converter(pdf_to_use)
+            # Attempt convert; many implementations support page slicing but we keep safe defaults.
             cv.convert(out_docx, start=0, end=None, layout_mode=True)
             cv.close()
             doc_check = Document(out_docx)
             if len(doc_check.paragraphs) > 0:
                 return send_file(out_docx, as_attachment=True, download_name="output.docx")
         except Exception:
-            # conversion failed -> fallback to OCR
             current_app.logger.info("pdf2docx conversion failed; falling back to OCR")
 
-        # OCR fallback (smart hybrid formatting)
+        # OCR fallback
         try:
             ocr_text = ocr_pdf_to_text(pdf_to_use, max_pages=MAX_OCR_PAGES, dpi=OCR_DPI)
         except Exception as e:
             current_app.logger.exception("OCR fallback failed")
             return jsonify({"error": "OCR failed.", "details": str(e)}), 500
 
-        # Save OCR text to docx with paragraphs & simple heuristics (headings / bullets)
         doc = Document()
         for block in ocr_text.split("\n\n"):
             block = block.strip()
             if not block:
                 continue
-            # Apply simple heading detection (all-caps or short lines)
             words = block.split()
             if 1 <= len(words) <= 8 and block.upper() == block and any(c.isalpha() for c in block):
                 p = doc.add_paragraph()
                 run = p.add_run(block)
                 run.bold = True
                 continue
-            # bullets
             if block.startswith("• "):
-                # create bullet list entries (docx supports paragraph style 'List Bullet')
                 for line in block.splitlines():
                     if line.strip():
                         p = doc.add_paragraph(line.strip().lstrip('•').strip(), style='List Bullet')
@@ -365,26 +406,28 @@ def pdf_to_word():
             doc.add_paragraph(block)
         doc.save(out_docx)
         return send_file(out_docx, as_attachment=True, download_name="output.docx")
-
     finally:
-        # final cleanup handled by after_this_request
         pass
 
 # -----------------------------
-# Endpoint: Word → PDF (LibreOffice on-demand)
+# Endpoint: Word → PDF (LibreOffice headless)
 # -----------------------------
 def safe_libreoffice_convert(input_path: str, out_dir: str, convert_filter: list):
-    """
-    Run LibreOffice headless conversion safely. convert_filter is list args after --convert-to.
-    """
     cmd = ["libreoffice", "--headless", "--norestore", "--nologo", "--invisible", "--convert-to"] + convert_filter + ["--outdir", out_dir, input_path]
-    run_subprocess(cmd)
+    run_subprocess(cmd, timeout=SUBPROCESS_TIMEOUT)
 
 @app.post("/word-to-pdf")
 def word_to_pdf():
-    f = request.files.get("file")
+    tool = "word-to-pdf"
+    files = [request.files.get("file")] if request.files.get("file") else []
+    ok, err = check_request_size_from_files(files, tool)
+    if not ok:
+        return abort(413, err)
+
+    f = files[0] if files else None
     if not f:
         return abort(400, "No file uploaded")
+
     ext = os.path.splitext(f.filename)[1].lower()
     if ext not in (".doc", ".docx"):
         return abort(400, "Upload a Word (.doc/.docx) file")
@@ -399,11 +442,9 @@ def word_to_pdf():
         return resp
 
     try:
-        # DOC/DOCX -> ODT
         try:
             safe_libreoffice_convert(doc_path, out_dir, ["odt"])
         except Exception:
-            # if conversion fails, surface an error
             return jsonify({"error": "LibreOffice conversion to ODT failed."}), 500
 
         base = os.path.splitext(os.path.basename(doc_path))[0]
@@ -411,7 +452,6 @@ def word_to_pdf():
         if not os.path.exists(odt_path):
             return jsonify({"error": "Intermediate ODT not found; conversion failed."}), 500
 
-        # ODT -> PDF (embed fonts, keep images quality)
         try:
             safe_libreoffice_convert(odt_path, out_dir, ["pdf:writer_pdf_Export:EmbedStandardFonts=true;ReduceImageResolution=false"])
         except Exception:
@@ -430,9 +470,16 @@ def word_to_pdf():
 # -----------------------------
 @app.post("/ppt-to-pdf")
 def ppt_to_pdf():
-    f = request.files.get("file")
+    tool = "ppt-to-pdf"
+    files = [request.files.get("file")] if request.files.get("file") else []
+    ok, err = check_request_size_from_files(files, tool)
+    if not ok:
+        return abort(413, err)
+
+    f = files[0] if files else None
     if not f:
         return abort(400, "No file uploaded")
+
     ext = os.path.splitext(f.filename)[1].lower()
     if ext not in (".ppt", ".pptx"):
         return abort(400, "Upload a PPT/PPTX file")
@@ -461,17 +508,22 @@ def ppt_to_pdf():
         pass
 
 # -----------------------------
-# Endpoint: JPG -> PDF
+# Endpoint: JPG -> PDF (disk-based, sequential)
 # -----------------------------
 @app.post("/jpg-to-pdf")
 def jpg_to_pdf():
+    tool = "jpg-to-pdf"
     files = request.files.getlist("files")
     if not files:
         return abort(400, "No files selected")
 
+    ok, err = check_request_size_from_files(files, tool)
+    if not ok:
+        return abort(413, err)
+
     Image = lazy_pil_Image()
     saved = []
-    images = []
+    image_paths = []
     out_pdf = tmp_file(".pdf")
 
     @after_this_request
@@ -482,39 +534,84 @@ def jpg_to_pdf():
         return resp
 
     try:
-        # Save uploads to disk and open sequentially
         for f in files:
             p = save_upload(f)
             saved.append(p)
             try:
-                img = Image.open(p).convert("RGB")
-                # do not keep PIL objects in memory longer than necessary:
-                images.append(p)  # store path; we'll open again when saving
+                # validate PIL can open
+                with Image.open(p) as im:
+                    im.verify()
+                image_paths.append(p)
             except Exception:
-                current_app.logger.exception("Failed to open image %s", p)
+                current_app.logger.exception("Failed to open/verify image %s", p)
                 cleanup(p)
-        # Build pdf using first image and appending the rest via Pillow (open one-by-one)
-        if not images:
+
+        if not image_paths:
             return abort(400, "No valid images uploaded")
-        # Pillow can accept file paths; open first
-        with Image.open(images[0]).convert("RGB") as first_img:
-            rest = []
-            for path in images[1:]:
+
+        # Build PDF using pillow opening images sequentially to avoid large memory use
+        with Image.open(image_paths[0]).convert("RGB") as first_img:
+            append_imgs = []
+            for path in image_paths[1:]:
                 with Image.open(path).convert("RGB") as im:
-                    rest.append(im.copy())
-            first_img.save(out_pdf, save_all=True, append_images=rest, dpi=(300,300), quality=90)
+                    append_imgs.append(im.copy())
+            first_img.save(out_pdf, save_all=True, append_images=append_imgs, dpi=(150,150), quality=85)
         return send_file(out_pdf, as_attachment=True, download_name="output.pdf")
     finally:
         pass
 
 # -----------------------------
-# Endpoint: PDF -> JPG (memory-friendly, disk-based)
+# Endpoint: PDF -> JPG (full or selected pages)
 # -----------------------------
 @app.post("/pdf-to-jpg")
 def pdf_to_jpg():
+    """
+    Accepts:
+      - file: uploaded PDF
+      - pages: optional form field string like "1,3,5-8"
+    Behavior:
+      - if pages provided -> convert those pages only
+      - else convert whole PDF
+    Result:
+      - images.zip with JPEGs (one file per page: page_1.jpg, ...)
+    """
+    tool = "pdf-to-jpg"
     f = request.files.get("file")
     if not f:
         return abort(400, "No file uploaded")
+
+    # size check
+    ok, err = check_request_size_from_files([f], tool)
+    if not ok:
+        return abort(413, err)
+
+    pages_param = (request.form.get("pages") or "").strip()
+    # parse pages_param into list of 1-based page numbers
+    def parse_page_list(s: str):
+        if not s:
+            return None
+        pages = set()
+        for part in s.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if "-" in part:
+                try:
+                    a, b = part.split("-", 1)
+                    a, b = int(a), int(b)
+                    if a > b:
+                        a, b = b, a
+                    pages.update(range(a, b + 1))
+                except Exception:
+                    continue
+            else:
+                try:
+                    pages.add(int(part))
+                except Exception:
+                    continue
+        return sorted(pages) if pages else None
+
+    pages = parse_page_list(pages_param)
 
     convert_from_path = lazy_pdf2image_convert()
     pdf_path = save_upload(f, ".pdf")
@@ -530,6 +627,7 @@ def pdf_to_jpg():
 
     try:
         try:
+            # use paths_only to write images to disk; thread_count single for memory constraints
             image_paths = convert_from_path(
                 pdf_path,
                 dpi=PDF_TO_JPG_DPI,
@@ -540,28 +638,51 @@ def pdf_to_jpg():
                 thread_count=IMAGE_THREAD_COUNT,
             )
         except Exception as e:
-            current_app.logger.exception("pdf2image failed")
+            current_app.logger.exception("pdf2image failed: %s", e)
             return jsonify({"error": "Failed to rasterize PDF", "details": str(e)}), 500
 
         if not image_paths:
             return jsonify({"error": "No images produced from PDF"}), 500
 
+        image_paths = sorted(image_paths)
+        total_pages = len(image_paths)
+
+        # If pages specified, filter and validate
+        if pages:
+            filtered = []
+            for p in pages:
+                if 1 <= p <= total_pages:
+                    filtered.append(image_paths[p - 1])
+            if not filtered:
+                return abort(400, "No valid pages requested")
+            image_paths = filtered
+
         # ZIP images on disk directly
         with zipfile.ZipFile(zip_path, "w") as z:
-            for p in sorted(image_paths):
-                z.write(p, arcname=os.path.basename(p))
+            for idx, p in enumerate(image_paths, start=1):
+                arcname = f"page_{idx}.jpg"
+                z.write(p, arcname=arcname)
         return send_file(zip_path, as_attachment=True, download_name="images.zip")
     finally:
         pass
+# ---------------- End of Part 2/3 ----------------
+# ---------------- Part 3/3 ----------------
+# app.py (PART 3/3) - merge, split, rotate, compress, protect, unlock, extract-text, cors, run
 
 # -----------------------------
 # Endpoint: Merge PDFs
 # -----------------------------
 @app.post("/merge-pdf")
 def merge_pdf():
+    tool = "merge-pdf"
     files = request.files.getlist("files")
     if not files:
         return abort(400, "No files uploaded")
+
+    ok, err = check_request_size_from_files(files, tool)
+    if not ok:
+        return abort(413, err)
+
     PdfReader, PdfWriter, PdfMerger = lazy_pypdf()
 
     merger = PdfMerger()
@@ -593,12 +714,17 @@ def merge_pdf():
 # -----------------------------
 @app.post("/split-pdf")
 def split_pdf():
+    tool = "split-pdf"
     f = request.files.get("file")
     if not f:
         return abort(400, "No file uploaded")
     ranges = request.form.get("ranges")
     if not ranges:
         return abort(400, "Missing ranges parameter")
+
+    ok, err = check_request_size_from_files([f], tool)
+    if not ok:
+        return abort(413, err)
 
     PdfReader, PdfWriter, _ = lazy_pypdf()
     pdf_path = save_upload(f, ".pdf")
@@ -652,9 +778,15 @@ def split_pdf():
 # -----------------------------
 @app.post("/rotate-pdf")
 def rotate_pdf():
+    tool = "rotate-pdf"
     f = request.files.get("file")
     if not f:
         return abort(400, "No file uploaded")
+
+    ok, err = check_request_size_from_files([f], tool)
+    if not ok:
+        return abort(413, err)
+
     try:
         angle = int(request.form.get("angle", 90) or 90)
     except Exception:
@@ -680,7 +812,6 @@ def rotate_pdf():
                 try:
                     page.rotate_clockwise(angle)
                 except Exception:
-                    # older/newer PyPDF2 differences, attempt safe rotate by transform
                     pass
             writer.add_page(page)
         with open(out_pdf, "wb") as o:
@@ -694,9 +825,15 @@ def rotate_pdf():
 # -----------------------------
 @app.post("/compress-pdf")
 def compress_pdf():
+    tool = "compress-pdf"
     f = request.files.get("file")
     if not f:
         return abort(400, "No file uploaded")
+
+    ok, err = check_request_size_from_files([f], tool)
+    if not ok:
+        return abort(413, err)
+
     input_pdf = save_upload(f, ".pdf")
     output_pdf = tmp_file(".pdf")
 
@@ -723,8 +860,8 @@ def compress_pdf():
             input_pdf
         ]
         try:
-            subprocess.run(cmd, check=True)
-        except subprocess.CalledProcessError:
+            run_subprocess(cmd, timeout=SUBPROCESS_TIMEOUT)
+        except Exception:
             return abort(500, "Ghostscript compression failed")
         return send_file(output_pdf, as_attachment=True, download_name="compressed.pdf", mimetype="application/pdf")
     finally:
@@ -735,11 +872,17 @@ def compress_pdf():
 # -----------------------------
 @app.post("/protect-pdf")
 def protect_pdf():
+    tool = "protect-pdf"
     PdfReader, PdfWriter, _ = lazy_pypdf()
     f = request.files.get("file")
     pwd = request.form.get("password")
     if not f or not pwd:
         return abort(400, "Missing file or password")
+
+    ok, err = check_request_size_from_files([f], tool)
+    if not ok:
+        return abort(413, err)
+
     pdf_path = save_upload(f, ".pdf")
     out_pdf = tmp_file(".pdf")
 
@@ -766,11 +909,17 @@ def protect_pdf():
 # -----------------------------
 @app.post("/unlock-pdf")
 def unlock_pdf():
+    tool = "unlock-pdf"
     PdfReader, PdfWriter, _ = lazy_pypdf()
     f = request.files.get("file")
     pwd = request.form.get("password", "")  # empty string allowed (try decrypt)
     if not f:
         return abort(400, "Missing file")
+
+    ok, err = check_request_size_from_files([f], tool)
+    if not ok:
+        return abort(413, err)
+
     pdf_path = save_upload(f, ".pdf")
     out_pdf = tmp_file(".pdf")
 
@@ -803,10 +952,16 @@ def unlock_pdf():
 # -----------------------------
 @app.post("/extract-text")
 def extract_text():
+    tool = "extract-text"
     pdfplumber = lazy_pdfplumber()
     f = request.files.get("file")
     if not f:
         return abort(400, "No file uploaded")
+
+    ok, err = check_request_size_from_files([f], tool)
+    if not ok:
+        return abort(413, err)
+
     pdf_path = save_upload(f, ".pdf")
 
     @after_this_request
@@ -829,11 +984,9 @@ def extract_text():
             current_app.logger.exception("pdfplumber extraction failed")
 
         if not has_text:
-            # OCR fallback (smart hybrid formatting)
             formatted = ocr_pdf_to_text(pdf_path, max_pages=MAX_OCR_PAGES, dpi=OCR_DPI)
             return jsonify({"text": formatted})
         else:
-            # Combine pages preserving page markers, then apply hybrid formatting
             combined = "\n\n".join(text_pages)
             stripped = "\n".join(line for line in combined.splitlines() if not line.strip().startswith('--- PAGE'))
             formatted = merge_lines_to_paragraphs(stripped)
@@ -869,4 +1022,6 @@ def handle_preflight():
 # Run (local)
 # -----------------------------
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    # debug off for production-like behavior
+    app.run(host="0.0.0.0", port=5000, debug=False)
+# ---------------- End of Part 3/3 ----------------
