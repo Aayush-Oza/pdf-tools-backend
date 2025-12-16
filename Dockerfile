@@ -2,9 +2,12 @@ FROM ubuntu:22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV HOME=/tmp
+ENV OMP_THREAD_LIMIT=1
+ENV SAL_USE_VCLPLUGIN=gen
+ENV JAVA_HOME=""
 
 # -------------------------------------------------
-# Install ONLY the required dependencies
+# Install required system dependencies
 # -------------------------------------------------
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
@@ -23,6 +26,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxext6 \
     libsm6 \
     fonts-dejavu-core \
+    fonts-liberation \
+    fonts-noto-core \
+    fonts-noto-cjk \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
@@ -31,17 +37,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # -------------------------------------------------
 WORKDIR /app
 
-# Install Python packages early to leverage caching
+# Install Python dependencies
 COPY requirements.txt .
 RUN pip3 install --no-cache-dir -r requirements.txt
 
-# Copy the application
+# Copy application code
 COPY . .
 
-# Port for Flask app
+# Expose Flask port
 EXPOSE 5000
 
 # -------------------------------------------------
-# Entry Point: Run Flask app
+# Run Flask app
 # -------------------------------------------------
 CMD ["python3", "app.py"]

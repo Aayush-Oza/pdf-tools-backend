@@ -1,5 +1,6 @@
 from flask import Flask, request, send_file, abort, jsonify, after_this_request, current_app
 import os, tempfile, shutil, subprocess, zipfile, logging, re
+os.environ["OMP_THREAD_LIMIT"] = "1"
 from werkzeug.utils import secure_filename
 from flask_cors import CORS
 
@@ -329,11 +330,18 @@ def pdf_to_word():
 # ======================================================
 def safe_libreoffice_convert(input_path, out_dir, convert_filter):
     cmd = [
-        "libreoffice", "--headless", "--norestore",
+        "libreoffice",
+        "--headless",
+        "--nologo",
+        "--nolockcheck",
+        "--nodefault",
+        "--norestore",
         "--convert-to", convert_filter,
-        "--outdir", out_dir, input_path
+        "--outdir", out_dir,
+        input_path
     ]
     run_subprocess(cmd)
+
 
 @app.post("/word-to-pdf")
 def word_to_pdf():
@@ -359,9 +367,28 @@ def word_to_pdf():
         cleanup(out_dir)
         return r
 
-    safe_libreoffice_convert(doc_path, out_dir, "pdf")
-    out = os.path.join(out_dir, os.path.splitext(os.path.basename(doc_path))[0] + ".pdf")
-    return send_file(out, as_attachment=True, download_name="output.pdf")
+    # STEP 1: DOC/DOCX → ODT
+    safe_libreoffice_convert(doc_path, out_dir, "odt")
+
+    base = os.path.splitext(os.path.basename(doc_path))[0]
+    odt_path = os.path.join(out_dir, base + ".odt")
+
+    if not os.path.exists(odt_path):
+        abort(500, "ODT conversion failed")
+
+    # STEP 2: ODT → PDF (best quality)
+    safe_libreoffice_convert(
+        odt_path,
+        out_dir,
+        "pdf:writer_pdf_Export:EmbedStandardFonts=true"
+    )
+
+    out_pdf = os.path.join(out_dir, base + ".pdf")
+    if not os.path.exists(out_pdf):
+        abort(500, "PDF conversion failed")
+
+    return send_file(out_pdf, as_attachment=True, download_name="output.pdf")
+
 
 # ======================================================
 # PPT → PDF
@@ -422,7 +449,15 @@ def jpg_to_pdf():
         with Image.open(p).convert("RGB") as im:
             images.append(im.copy())
 
-    images[0].save(out_pdf, save_all=True, append_images=images[1:])
+    images[0].save(
+    out_pdf,
+    save_all=True,
+    append_images=images[1:],
+    dpi=(300, 300),
+    quality=95,
+    subsampling=0
+)
+
     return send_file(out_pdf, as_attachment=True, download_name="output.pdf")
 
 # ======================================================
@@ -453,6 +488,17 @@ def pdf_to_jpg():
         cleanup(zip_path)
         return r
 
+    # ✅ Parse page ranges
+    page_numbers = None
+    if pages:
+        page_numbers = set()
+        for part in pages.split(","):
+            if "-" in part:
+                a, b = map(int, part.split("-"))
+                page_numbers.update(range(a, b + 1))
+            else:
+                page_numbers.add(int(part))
+
     imgs = convert_from_path(
         pdf,
         dpi=PDF_TO_JPG_DPI,
@@ -460,11 +506,13 @@ def pdf_to_jpg():
         output_folder=out_dir,
         fmt="jpeg",
         paths_only=True,
-        thread_count=1,
+        thread_count=IMAGE_THREAD_COUNT,
     )
 
     with zipfile.ZipFile(zip_path, "w") as z:
         for i, p in enumerate(imgs, 1):
+            if page_numbers and i not in page_numbers:
+                continue
             z.write(p, f"page_{i}.jpg")
 
     return send_file(zip_path, as_attachment=True, download_name="images.zip")
@@ -547,6 +595,9 @@ def compress_pdf():
     if not f:
         abort(400)
 
+    if not shutil.which("gs"):
+        abort(500, "Ghostscript not installed")
+
     ok, err = check_request_size_from_files([f], tool)
     if not ok:
         abort(413, err)
@@ -561,10 +612,17 @@ def compress_pdf():
         return r
 
     cmd = [
-        "gs", "-sDEVICE=pdfwrite", "-dPDFSETTINGS=/ebook",
-        "-dNOPAUSE", "-dBATCH",
-        f"-sOutputFile={out}", inp
+        "gs",
+        "-sDEVICE=pdfwrite",
+        "-dCompatibilityLevel=1.4",
+        "-dPDFSETTINGS=/printer",
+        "-dNOPAUSE",
+        "-dBATCH",
+        "-dQUIET",
+        f"-sOutputFile={out}",
+        inp
     ]
+
     run_subprocess(cmd)
     return send_file(out, as_attachment=True, download_name="compressed.pdf")
 
