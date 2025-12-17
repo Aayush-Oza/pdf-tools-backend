@@ -408,29 +408,43 @@ def ppt_to_pdf():
     tool = "ppt-to-pdf"
     f = request.files.get("file")
     if not f:
-        abort(400)
+        abort(400, "No file uploaded")
 
     ok, err = check_request_size_from_files([f], tool)
     if not ok:
         abort(413, err)
 
-    ppt = save_upload(f, ".pptx", get_limit_for_tool(tool))
+    ext = os.path.splitext(f.filename)[1].lower()
+    if ext not in (".ppt", ".pptx"):
+        abort(400, "Invalid PPT file")
+
+    ppt = save_upload(f, ext, get_limit_for_tool(tool))
     out_dir = tmp_dir()
 
     @after_this_request
-    def _c(r):
+    def _cleanup(r):
         cleanup(ppt)
         cleanup(out_dir)
         return r
 
-    safe_libreoffice_convert(ppt, out_dir, "pdf")
+    # 🔥 Convert PPT → PDF
+    try:
+        safe_libreoffice_convert(ppt, out_dir, "pdf")
+    except Exception as e:
+        abort(500, "LibreOffice conversion failed")
 
-    base_name = os.path.splitext(f.filename)[0]
-    out_pdf = os.path.join(out_dir, base_name + ".pdf")
+    base = os.path.splitext(os.path.basename(ppt))[0]
+    out_pdf = os.path.join(out_dir, base + ".pdf")
 
-    resp = send_file(out_pdf, as_attachment=True)
-    resp.headers["X-Filename"] = f"{base_name}.pdf"
-    return resp
+    # 🔥 IMPORTANT CHECK
+    if not os.path.exists(out_pdf):
+        abort(500, "PDF not generated (LibreOffice missing)")
+
+    final_name = os.path.splitext(f.filename)[0] + ".pdf"
+
+    response = send_file(out_pdf, as_attachment=True)
+    response.headers["X-Filename"] = final_name
+    return response
 
 # ======================================================
 # JPG → PDF (LOW MEMORY)
