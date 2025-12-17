@@ -25,7 +25,7 @@ PER_TOOL_LIMIT_BYTES = {
 
 MAX_OCR_PAGES = 30
 OCR_DPI = 150
-PDF_TO_JPG_DPI = 140
+PDF_TO_JPG_DPI = 200
 IMAGE_THREAD_COUNT = 1
 SUBPROCESS_TIMEOUT = 120
 
@@ -63,6 +63,10 @@ def lazy_pdfplumber():
 def lazy_docx_Document():
     from docx import Document
     return Document
+
+def with_filename(response, filename):
+    response.headers["X-Filename"] = filename
+    return response
 
 # ======================================================
 # TEMP FILE HELPERS
@@ -602,6 +606,14 @@ def compress_pdf():
     if not ok:
         abort(413, err)
 
+    level = request.form.get("level", "screen")
+
+    GS_LEVELS = {
+        "low": "/screen",     # maximum compression
+        "medium": "/ebook",   # balanced
+        "high": "/printer",   # high quality
+    }
+
     inp = save_upload(f, ".pdf", get_limit_for_tool(tool))
     out = tmp_file(".pdf")
 
@@ -615,16 +627,25 @@ def compress_pdf():
         "gs",
         "-sDEVICE=pdfwrite",
         "-dCompatibilityLevel=1.4",
-        "-dPDFSETTINGS=/printer",
+        f"-dPDFSETTINGS={GS_LEVELS.get(level, '/screen')}",
         "-dNOPAUSE",
         "-dBATCH",
         "-dQUIET",
+        "-dDetectDuplicateImages=true",
+        "-dCompressFonts=true",
+        "-dDownsampleColorImages=true",
+        "-dColorImageResolution=150",
         f"-sOutputFile={out}",
         inp
     ]
 
     run_subprocess(cmd)
-    return send_file(out, as_attachment=True, download_name="compressed.pdf")
+    orig = os.path.splitext(f.filename)[0]
+    final_name = f"{orig}_compressed.pdf"
+
+    resp = send_file(out, as_attachment=True)
+    return with_filename(resp, final_name)
+
 
 # ======================================================
 # PROTECT / UNLOCK PDF
@@ -662,10 +683,10 @@ def unlock_pdf():
     tool = "unlock-pdf"
     f = request.files.get("file")
     pwd = request.form.get("password", "")
+
     if not f:
         abort(400)
 
-    PdfReader, PdfWriter, _ = lazy_pypdf()
     pdf = save_upload(f, ".pdf", get_limit_for_tool(tool))
     out = tmp_file(".pdf")
 
@@ -675,15 +696,12 @@ def unlock_pdf():
         cleanup(out)
         return r
 
-    r = PdfReader(pdf)
-    if r.is_encrypted and r.decrypt(pwd) != 1:
+    try:
+        pikepdf = lazy_pikepdf()
+        with pikepdf.open(pdf, password=pwd) as p:
+            p.save(out)
+    except Exception:
         abort(400, "Wrong password")
-
-    w = PdfWriter()
-    for p in r.pages:
-        w.add_page(p)
-    with open(out, "wb") as o:
-        w.write(o)
 
     return send_file(out, as_attachment=True, download_name="unlocked.pdf")
 
