@@ -234,7 +234,13 @@ def rotate_pdf():
         writer.add_page(p)
     with open(out, "wb") as f:
         writer.write(f)
-    return send_file(out, as_attachment=True)
+    original_name = os.path.splitext(f.filename)[0]
+    download_name = f"{original_name}_rotated.pdf"
+
+    response = send_file(out, as_attachment=True)
+    response.headers["X-Filename"] = download_name
+    return response
+
 
 # ======================================================
 # ROOT
@@ -519,7 +525,10 @@ def pdf_to_jpg():
                 continue
             z.write(p, f"page_{i}.jpg")
 
-    return send_file(zip_path, as_attachment=True, download_name="images.zip")
+    orig = os.path.splitext(f.filename)[0]
+    resp = send_file(zip_path, as_attachment=True)
+    return with_filename(resp, f"{orig}_images.zip")
+
 
 # ======================================================
 # MERGE PDF
@@ -546,7 +555,9 @@ def merge_pdf():
         merger.append(p)
     merger.write(out)
     merger.close()
-    return send_file(out, as_attachment=True, download_name="merged.pdf")
+    resp = send_file(out, as_attachment=True)
+    return with_filename(resp, "merged.pdf")
+
 
 # ======================================================
 # SPLIT PDF
@@ -737,4 +748,9 @@ def extract_text():
     if not text.strip():
         text = ocr_pdf_to_text(pdf)
 
-    return jsonify({"text": merge_lines_to_paragraphs(text)})
+    original_name = os.path.splitext(f.filename)[0]
+
+    return jsonify({
+        "text": merge_lines_to_paragraphs(text),
+        "filename": f"{original_name}.txt"
+    })
