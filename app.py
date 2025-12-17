@@ -424,8 +424,13 @@ def ppt_to_pdf():
         return r
 
     safe_libreoffice_convert(ppt, out_dir, "pdf")
-    out = os.path.join(out_dir, os.path.splitext(os.path.basename(ppt))[0] + ".pdf")
-    return send_file(out, as_attachment=True, download_name="output.pdf")
+
+    base_name = os.path.splitext(f.filename)[0]
+    out_pdf = os.path.join(out_dir, base_name + ".pdf")
+
+    resp = send_file(out_pdf, as_attachment=True)
+    resp.headers["X-Filename"] = f"{base_name}.pdf"
+    return resp
 
 # ======================================================
 # JPG → PDF (LOW MEMORY)
