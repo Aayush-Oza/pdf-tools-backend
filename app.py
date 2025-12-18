@@ -254,6 +254,7 @@ def cors(r):
     r.headers["Access-Control-Allow-Origin"] = "*"
     r.headers["Access-Control-Allow-Headers"] = "*"
     r.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    r.headers["Access-Control-Expose-Headers"] = "X-Filename"
     return r
 
 @app.before_request
