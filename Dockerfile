@@ -14,6 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libreoffice-writer \
     libreoffice-impress \
     libreoffice-calc \
+    default-jre
     poppler-utils \
     ghostscript \
     tesseract-ocr \
@@ -27,10 +28,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libsm6 \
     fonts-dejavu-core \
     fonts-noto-core \
-    fonts-noto-extra \
-    fonts-noto-ui-core \
-    fonts-lohit-devanagari \
-    fonts-lohit-gujarati \
+    fonts-noto-ui-extra \
+    fonts-noto-devanagari \
+    fonts-noto-gujarati \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
     
@@ -53,6 +53,5 @@ EXPOSE 5000
 # Entry Point: Run Flask app
 # -------------------------------------------------
 CMD ["gunicorn", "--timeout", "180", "-w", "2", "-k", "sync", "-b", "0.0.0.0:5000", "app:app"]
-
 
 
