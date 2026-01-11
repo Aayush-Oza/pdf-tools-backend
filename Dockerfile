@@ -28,9 +28,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libsm6 \
     fonts-dejavu-core \
     fonts-noto-core \
-    fonts-noto-ui-extra \
-    fonts-noto-devanagari \
-    fonts-noto-gujarati \
+    fonts-noto-ui-core \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
     
@@ -53,6 +51,7 @@ EXPOSE 5000
 # Entry Point: Run Flask app
 # -------------------------------------------------
 CMD ["gunicorn", "--timeout", "180", "-w", "2", "-k", "sync", "-b", "0.0.0.0:5000", "app:app"]
+
 
 
 
