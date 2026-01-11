@@ -17,15 +17,23 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     poppler-utils \
     ghostscript \
     tesseract-ocr \
+    tesseract-ocr-hin \
+    tesseract-ocr-mar \
+    tesseract-ocr-guj \
     libjpeg-turbo8 \
     libtiff5 \
     libxrender1 \
     libxext6 \
     libsm6 \
     fonts-dejavu-core \
+    fonts-noto-core \
+    fonts-noto-extra \
+    fonts-noto-ui-core \
+    fonts-lohit-devanagari \
+    fonts-lohit-gujarati \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
-
+    
 # -------------------------------------------------
 # Set working directory
 # -------------------------------------------------
@@ -45,5 +53,6 @@ EXPOSE 5000
 # Entry Point: Run Flask app
 # -------------------------------------------------
 CMD ["gunicorn", "--timeout", "180", "-w", "2", "-k", "sync", "-b", "0.0.0.0:5000", "app:app"]
+
 
 
