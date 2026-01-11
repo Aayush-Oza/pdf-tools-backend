@@ -196,7 +196,11 @@ def ocr_pdf_to_text(pdf_path, max_pages=MAX_OCR_PAGES, dpi=OCR_DPI):
         texts = []
         for i, p in enumerate(imgs, 1):
             with Image.open(p).convert("L") as im:
-                txt = pytesseract.image_to_string(im, config="--psm 3")
+                txt = pytesseract.image_to_string(
+                    im,
+                    lang="hin+mar+guj+eng",
+                    config="--psm 3"
+                )
                 texts.append(txt)
 
         return merge_lines_to_paragraphs("\n".join(texts))
@@ -391,7 +395,7 @@ def word_to_pdf():
     safe_libreoffice_convert(
         odt_path,
         out_dir,
-        "pdf:writer_pdf_Export:EmbedStandardFonts=true"
+        "pdf:writer_pdf_Export:EmbedFonts=true"
     )
 
     out_pdf = os.path.join(out_dir, base + ".pdf")
@@ -399,7 +403,6 @@ def word_to_pdf():
         abort(500, "PDF conversion failed")
 
     return send_file(out_pdf, as_attachment=True, download_name="output.pdf")
-
 
 # ======================================================
 # PPT → PDF
@@ -578,7 +581,6 @@ def merge_pdf():
     resp = send_file(out, as_attachment=True)
     return with_filename(resp, "merged.pdf")
 
-
 # ======================================================
 # SPLIT PDF
 # ======================================================
@@ -676,7 +678,6 @@ def compress_pdf():
 
     resp = send_file(out, as_attachment=True)
     return with_filename(resp, final_name)
-
 
 # ======================================================
 # PROTECT / UNLOCK PDF
