@@ -14,7 +14,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libreoffice-writer \
     libreoffice-impress \
     libreoffice-calc \
-    default-jre
+    default-jre \
     poppler-utils \
     ghostscript \
     tesseract-ocr \
@@ -53,5 +53,6 @@ EXPOSE 5000
 # Entry Point: Run Flask app
 # -------------------------------------------------
 CMD ["gunicorn", "--timeout", "180", "-w", "2", "-k", "sync", "-b", "0.0.0.0:5000", "app:app"]
+
 
 
